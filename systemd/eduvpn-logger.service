@@ -1,0 +1,24 @@
+[Unit]
+Description=eduVPN correlated log (vpn-user-portal + proxyguard + WireGuard)
+After=network.target apache2.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/eduvpn-logger.py
+Restart=always
+RestartSec=2
+
+# Optional overrides (defaults shown). Uncomment and edit as needed.
+#Environment=EDUVPN_LOG=/var/log/eduvpn/eduvpn.log
+#Environment=EDUVPN_PORTAL_DB=/var/lib/vpn-user-portal/db.sqlite
+#Environment=EDUVPN_PROXYGUARD_START_LOG=/var/log/apache2/proxyguard_start.log
+#Environment=EDUVPN_GEOIP_DB=/usr/local/share/GeoIP/GeoLite2-City.mmdb
+#Environment=EDUVPN_GEOIP_LANG=en
+#Environment=EDUVPN_SYSLOG_IDENT=eduvpn-logger
+#Environment=EDUVPN_SYSLOG_FACILITY=local0
+#Environment=EDUVPN_WG_POLL_SEC=2.0
+#Environment=EDUVPN_DISCONNECT_AFTER_SEC=180.0
+#Environment=EDUVPN_CONNECT_GRACE_SEC=10.0
+
+[Install]
+WantedBy=multi-user.target

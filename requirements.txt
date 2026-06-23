@@ -1,0 +1,4 @@
+# Optional: GeoIP enrichment. Without it the correlator runs fine, just omits
+# the country/city fields. On Debian/Ubuntu you can instead use the distro
+# package: apt install python3-maxminddb (or python3-geoip2).
+maxminddb>=2.0

@@ -1,0 +1,16 @@
+[Unit]
+Description=Watch Apache ErrorLog for ProxyGuard START events
+After=apache2.service
+Wants=apache2.service
+
+[Service]
+Type=simple
+# Adjust the error-log path to your VirtualHost's ErrorLog.
+ExecStart=/bin/sh -c 'exec tail -F /var/log/apache2/error.log | python3 -u /usr/local/sbin/proxyguard-watcher.py'
+Restart=always
+RestartSec=2
+
+#Environment=EDUVPN_PROXYGUARD_START_LOG=/var/log/apache2/proxyguard_start.log
+
+[Install]
+WantedBy=multi-user.target

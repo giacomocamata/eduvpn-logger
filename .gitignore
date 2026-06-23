@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.mmdb
+
+# Local-only context for Claude Code — not for publication
+CLAUDE.md
