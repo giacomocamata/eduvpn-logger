@@ -111,12 +111,19 @@ sudo ./install.sh
 
 `install.sh` is idempotent: it installs dependencies, copies both scripts to
 `/usr/local/sbin`, installs and enables the systemd units, creates
-`/var/log/eduvpn`, and drops the rsyslog snippet. It then prints the two steps
-that cannot be safely automated — the MaxMind GeoIP license and the Apache
-VirtualHost edit (both below). For a manual install, see
+`/var/log/eduvpn`, and drops the rsyslog snippet. When it finishes, the
+`eduvpn-logger` daemon is **already running** with default settings — verify with
+`journalctl -fu eduvpn-logger.service`. To complete the setup, follow the
+post-install steps below. For a manual install, see
 [Manual install](#manual-install).
 
-## Apache / ProxyGuard logging
+## Post-install steps
+
+`install.sh` configures everything it safely can; the rest depends on your site
+and is done by hand. UDP-only deployments without GeoIP can stop after step 3
+(or skip it and keep the defaults).
+
+### 1. Apache / ProxyGuard logging
 
 ProxyGuard tunnels WireGuard over TCP/443, so the kernel sees those packets as
 originating from `127.0.0.1`; the client's real public IP is visible **only** to
@@ -147,7 +154,7 @@ apache2ctl configtest && sudo systemctl reload apache2
 sudo systemctl enable --now proxyguard-watcher.service
 ```
 
-## GeoIP (optional)
+### 2. GeoIP enrichment (optional)
 
 ```bash
 sudo apt install -y python3-maxminddb geoipupdate   # Debian/Ubuntu
@@ -157,11 +164,40 @@ sudo geoipupdate -v
 ```
 
 Without a database the daemon runs unchanged and simply omits `country`/`city`.
+`install.sh` already installs the packages; only the license key is manual.
 
-## Configuration
+### 3. Customising the configuration
 
-All configuration is via environment variables (all optional); place overrides
-in the systemd unit. Defaults match a stock Debian eduVPN install.
+The daemon is configured entirely through environment variables, all optional
+(see the [reference table](#configuration-reference)). Defaults match a stock
+Debian eduVPN install, so most deployments need no changes.
+
+To override a value, edit the systemd unit installed at
+`/etc/systemd/system/eduvpn-logger.service`. It ships with every variable listed
+as a commented `Environment=` line at its default — uncomment the ones you want
+and edit them:
+
+```ini
+[Service]
+# example: prefer Italian GeoIP names and a faster poll
+Environment=EDUVPN_GEOIP_LANG=it,en
+Environment=EDUVPN_WG_POLL_SEC=1.0
+```
+
+Then reload systemd and restart the daemon for the change to take effect:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart eduvpn-logger.service
+```
+
+(For a one-off test you can instead run the script directly with the variables
+inline, e.g. `sudo EDUVPN_LOG=/tmp/test.log eduvpn-logger.py`, leaving the
+installed service untouched.)
+
+## Configuration reference
+
+All variables are optional. Defaults match a stock Debian eduVPN install.
 
 | Variable | Default | Meaning |
 |---|---|---|
