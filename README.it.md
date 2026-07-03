@@ -102,8 +102,10 @@ dopo un crash.
 
 - Linux con `systemd`, `journalctl` e il comando `wg` (`wireguard-tools`).
 - Un deployment eduVPN v3 (`vpn-user-portal`) basato su WireGuard.
-- Apache con ProxyGuard (il fallback TCP-443 di eduVPN) — vedi sotto.
 - Python 3.9+ (solo standard library). L'arricchimento GeoIP richiede `maxminddb`.
+- *Opzionale:* Apache con ProxyGuard (il fallback TCP-443 di eduVPN) — serve solo
+  ad attribuire l'IP sorgente reale delle sessioni in fallback TCP; i deployment
+  solo-UDP possono ometterlo del tutto (vedi sotto).
 
 ## Avvio rapido
 
@@ -260,7 +262,8 @@ python3 test_eduvpn_logger.py
 ```
 
 Copre le funzioni di parsing pure (split endpoint/IPv6, key=value, marker device,
-parsing riga ProxyGuard), senza framework esterni.
+parsing riga ProxyGuard, output `wg show` dump/transfer) e la logica di
+riconciliazione dello stato, senza framework esterni.
 
 ## Licenza
 

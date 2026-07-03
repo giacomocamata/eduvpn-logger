@@ -54,6 +54,36 @@ def test_parse_proxyguard_start_line():
     assert mod._parse_proxyguard_start_line("2026-04-15T09:58:01+02:00 event=start") is None
 
 
+def test_parse_wg_dump_output():
+    # interface header (fewer fields) + one peer line, tab-separated
+    text = (
+        "wg0\tPRIVKEY=\tSRVPUB=\t51820\toff\n"
+        "wg0\tPEER1=\t(none)\t203.0.113.45:48049\t10.20.0.5/32\t1713168000\t1111\t2222\toff\n"
+        "wg0\tPEER2=\t(none)\t(none)\t10.20.0.6/32\t0\t0\t0\toff\n"
+    )
+    snap, hs, ep = mod._parse_wg_dump_output(text)
+    assert snap == {"PEER1=": (1111, 2222), "PEER2=": (0, 0)}
+    assert hs == {"PEER1=": 1713168000, "PEER2=": 0}
+    assert ep["PEER1="] == "203.0.113.45:48049"
+    assert ep["PEER2="] == "(none)"
+    # garbage lines are skipped
+    assert mod._parse_wg_dump_output("not\ta\tpeer\tline") == ({}, {}, {})
+
+
+def test_parse_wg_transfer_output():
+    # `wg show all transfer`: <iface>\t<pubkey>\t<rx>\t<tx>
+    text = "wg0\tPEER1=\t1111\t2222\nwg0\tPEER2=\t0\t0\nnoise line\n"
+    snap = mod._parse_wg_transfer_output(text)
+    assert snap == {"PEER1=": (1111, 2222), "PEER2=": (0, 0)}
+    assert mod._parse_wg_transfer_output("") == {}
+
+
+def test_active_window_never_exceeds_disconnect_threshold():
+    # Otherwise a peer past the synth-disconnect threshold would still count as
+    # "active" and flap connect/disconnect (see ACTIVE_HANDSHAKE_MAX_AGE_SEC).
+    assert mod.ACTIVE_HANDSHAKE_MAX_AGE_SEC <= mod.SYNTH_DISCONNECT_AFTER_SEC
+
+
 def test_is_global_ip():
     assert mod._is_global_ip("8.8.8.8") is True
     assert mod._is_global_ip("127.0.0.1") is False

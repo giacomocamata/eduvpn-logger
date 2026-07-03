@@ -131,14 +131,67 @@ def _device_from_client_marker(*markers: str) -> str:
     return "-"
 
 
+def _parse_wg_dump_output(
+    text: str,
+) -> Tuple[Dict[str, Tuple[int, int]], Dict[str, int], Dict[str, str]]:
+    # `wg show all dump`: one tab-separated line per peer:
+    #   <iface> <pubkey> <psk> <endpoint> <allowed-ips> <handshake> <rx> <tx> <keepalive>
+    # The per-interface header line has fewer fields and is skipped by the length check.
+    snap: Dict[str, Tuple[int, int]] = {}
+    handshake: Dict[str, int] = {}
+    endpoint: Dict[str, str] = {}
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 9:
+            continue
+        pubkey = parts[1].strip()
+        ep = parts[3].strip()
+        hs_raw = parts[5].strip()
+        rx_raw = parts[6].strip()
+        tx_raw = parts[7].strip()
+        try:
+            rx = int(rx_raw)
+            tx = int(tx_raw)
+            hs = int(hs_raw) if hs_raw else 0
+        except Exception:
+            continue
+        if pubkey:
+            snap[pubkey] = (rx, tx)
+            handshake[pubkey] = hs
+            endpoint[pubkey] = ep
+    return snap, handshake, endpoint
+
+
+def _parse_wg_transfer_output(text: str) -> Dict[str, Tuple[int, int]]:
+    # `wg show all transfer`: one tab-separated line per peer:
+    #   <iface> <pubkey> <rx> <tx>
+    snap: Dict[str, Tuple[int, int]] = {}
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue
+        pubkey = parts[1].strip()
+        try:
+            rx = int(parts[2].strip())
+            tx = int(parts[3].strip())
+        except Exception:
+            continue
+        if pubkey:
+            snap[pubkey] = (rx, tx)
+    return snap
+
+
 WG_CONNECTED_PREFIX = " connected from "
 WG_DISCONNECTED_PREFIX = " disconnected from "
 WG_ROAMED_PREFIX = " roamed to "
 
-# A peer is "active" while its last WireGuard handshake is within this window.
-ACTIVE_HANDSHAKE_MAX_AGE_SEC = 180.0
 # Emit a disconnect after this many seconds of handshake silence. Overridable via env.
 SYNTH_DISCONNECT_AFTER_SEC = float(os.environ.get("EDUVPN_DISCONNECT_AFTER_SEC", "180.0"))
+# A peer is "active" while its last WireGuard handshake is within this window.
+# Capped at the disconnect threshold: a peer already past that threshold must never
+# count as active again, or lowering EDUVPN_DISCONNECT_AFTER_SEC below 180 would
+# make idle-but-alive peers flap (synth disconnect -> still "active" -> re-connect).
+ACTIVE_HANDSHAKE_MAX_AGE_SEC = min(180.0, SYNTH_DISCONNECT_AFTER_SEC)
 # Defer a synthesized connect this long so the portal event / DB row can attribute it
 # to a user before we emit; we emit early as soon as it resolves. Overridable via env.
 CONNECT_GRACE_SEC = float(os.environ.get("EDUVPN_CONNECT_GRACE_SEC", "10.0"))
@@ -582,30 +635,12 @@ class Correlator:
             p = None
         if p is not None and p.returncode == 0:
             ok = True
-        if p is not None and p.returncode == 0 and p.stdout:
-            for line in p.stdout.splitlines():
-                parts = line.split("\t")
-                if len(parts) < 9:
-                    continue
-                if parts[0] == "interface" and parts[1] == "public-key":
-                    continue
-                pubkey = parts[1].strip()
-                ep = parts[3].strip()
-                hs_raw = parts[5].strip()
-                rx_raw = parts[6].strip()
-                tx_raw = parts[7].strip()
-                try:
-                    rx = int(rx_raw)
-                    tx = int(tx_raw)
-                    hs = int(hs_raw) if hs_raw else 0
-                except Exception:
-                    continue
-                if pubkey:
-                    snap[pubkey] = (rx, tx)
-                    handshake[pubkey] = hs
-                    endpoint[pubkey] = ep
+            if p.stdout:
+                snap, handshake, endpoint = _parse_wg_dump_output(p.stdout)
 
         if not snap:
+            # Degraded fallback: byte counters only (no handshake/endpoint, so no
+            # event synthesis this cycle — just keeps the transfer deltas moving).
             try:
                 p = subprocess.run(
                     [wg, "show", "all", "transfer"],
@@ -617,28 +652,8 @@ class Correlator:
                 p = None
             if p is not None and p.returncode == 0:
                 ok = True
-            if p is not None and p.returncode == 0 and p.stdout:
-                current_peer = None
-                for raw in p.stdout.splitlines():
-                    line = raw.strip()
-                    if not line:
-                        continue
-                    if line.startswith("peer:"):
-                        current_peer = line.split(":", 1)[1].strip()
-                        continue
-                    if current_peer is None:
-                        continue
-                    if not line.startswith("transfer:"):
-                        continue
-                    m = re.search(r"transfer:\s*(\d+)\s*received,\s*(\d+)\s*sent", line)
-                    if m is None:
-                        continue
-                    try:
-                        rx = int(m.group(1))
-                        tx = int(m.group(2))
-                    except Exception:
-                        continue
-                    snap[current_peer] = (rx, tx)
+                if p.stdout:
+                    snap = _parse_wg_transfer_output(p.stdout)
 
         return snap, handshake, endpoint, ok
 
@@ -1192,6 +1207,9 @@ class GeoIp:
         try:
             import maxminddb  # type: ignore
         except Exception:
+            if GEOIP_DB:
+                # The operator explicitly asked for GeoIP: don't fail silently.
+                _log_err("geoip", RuntimeError("EDUVPN_GEOIP_DB is set but the maxminddb module is not installed"))
             return
 
         paths = (GEOIP_DB,) if GEOIP_DB else GEOIP_DEFAULT_PATHS
@@ -1200,8 +1218,11 @@ class GeoIp:
                 if p and os.path.exists(p):
                     self._reader = maxminddb.open_database(p)  # type: ignore
                     return
-            except Exception:
+            except Exception as e:
                 self._reader = None
+                _log_err("geoip", RuntimeError(f"cannot open GeoIP database {p}: {e!r}"))
+        if GEOIP_DB and self._reader is None:
+            _log_err("geoip", FileNotFoundError(GEOIP_DB))
 
     def _name(self, node: object) -> Optional[str]:
         if not isinstance(node, dict):
