@@ -14,9 +14,11 @@ fi
 echo "==> Installing dependencies"
 # wireguard-tools and python3 are required; the GeoIP packages are optional and installed one
 # at a time (geoipupdate is in Debian *contrib*, python3-maxminddb may need EPEL):
-# one missing optional package must not abort the required one.
+# one missing optional package must not abort the required one. Already installed
+# packages are left alone: installing the logger must not upgrade a live server's
+# python3 or wireguard-tools as a side effect (dnf install never upgrades).
 if command -v apt-get >/dev/null 2>&1; then
-    PKG="apt-get install -y"
+    PKG="apt-get install -y --no-upgrade"
     apt-get update -qq || true
 elif command -v dnf >/dev/null 2>&1; then
     PKG="dnf install -y"
