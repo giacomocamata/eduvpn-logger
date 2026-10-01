@@ -363,8 +363,7 @@ conservazione, da definire con l'ateneo e il suo DPO.
   (per leggere il DB del portale di `www-data`, anche in modalità WAL), con il
   sandboxing systemd (`ProtectSystem`, `PrivateDevices`, `RestrictAddressFamilies`,
   `SystemCallFilter`, `MemoryDenyWriteExecute`, …). `proxyguard-watcher` non ha
-  alcuna capability né rete. Entrambi sono verificati dal test end-to-end qui
-  sotto; controllali con `systemd-analyze security <unit>`.
+  alcuna capability né rete; controllali con `systemd-analyze security <unit>`.
 
 ## Installazione manuale
 
@@ -381,42 +380,6 @@ sudo systemctl enable --now eduvpn-logger.service
 ```
 
 Poi completa i passaggi portale, Apache e GeoIP sopra e abilita `proxyguard-watcher.service`.
-
-## Test
-
-Due livelli, senza framework esterni.
-
-**Test unitari e di scenario** — qualunque OS, senza privilegi, Python 3.9+:
-
-```bash
-python3 test_eduvpn_logger.py
-```
-
-Copre le funzioni pure (split endpoint/IPv6, key=value, tutti i formati degli
-eventi del portale, marker device, parsing ProxyGuard e dell'ErrorLog Apache,
-output `wg show` dump/transfer, regola degli UID attendibili, I/O del cursore
-journal) e scenari della macchina a stati di correlazione, guidata da un orologio
-e un `wg show` finti (attribuzione TCP delle sessioni lunghe e `tcp_candidates`,
-connect pendenti, riconnessioni con la stessa chiave, insieme di peer vuoto).
-
-**Test end-to-end** — una macchina Linux *usa e getta* con systemd (VM, WSL2,
-runner CI), come root:
-
-```bash
-sudo EDUVPN_E2E_DISPOSABLE=1 bash e2e_test.sh
-```
-
-Esegue `install.sh` (tre volte, verificando idempotenza e sopravvivenza dei
-drop-in), poi pilota i servizi installati e in sandbox con componenti reali:
-client WireGuard in network namespace (UDP, roaming, e un percorso TCP/ProxyGuard
-tramite un relay UDP su loopback che fa vedere al server `127.0.0.1`, con lo START
-letto da `proxyguard-watcher` nell'`error.log` di Apache), eventi del portale
-scritti nel journal come `www-data`, tentativi di spoofing da UID non di sistema,
-uno START falsificato nel path di una richiesta, un DB del portale `wg_peers`,
-riavvii del daemon (replay del journal, cursore inutilizzabile), `logrotate` e
-disconnect da silenzio dell'handshake. Installa pacchetti, un utente di test e un
-DB finto del portale, quindi si rifiuta di partire se
-`/var/lib/vpn-user-portal/db.sqlite` esiste già. Circa 5 minuti.
 
 ## Licenza
 

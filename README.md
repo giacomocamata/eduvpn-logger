@@ -351,8 +351,8 @@ period, defined by your institution with its DPO.
   (to read the `www-data`-owned portal DB, also in WAL mode), with systemd
   sandboxing (`ProtectSystem`, `PrivateDevices`, `RestrictAddressFamilies`,
   `SystemCallFilter`, `MemoryDenyWriteExecute`, …). `proxyguard-watcher` has no
-  capabilities and no network at all. Both are exercised by the end-to-end test
-  below; check them with `systemd-analyze security <unit>`.
+  capabilities and no network at all; check them with
+  `systemd-analyze security <unit>`.
 
 ## Manual install
 
@@ -369,41 +369,6 @@ sudo systemctl enable --now eduvpn-logger.service
 ```
 
 Then complete the portal, Apache and GeoIP steps above and enable `proxyguard-watcher.service`.
-
-## Testing
-
-Two levels, no external framework.
-
-**Unit and scenario tests** — any OS, no privileges, Python 3.9+:
-
-```bash
-python3 test_eduvpn_logger.py
-```
-
-Covers the pure helpers (endpoint/IPv6 splitting, key=value, every portal event
-format, device markers, ProxyGuard and Apache error-log parsing, `wg show`
-dump/transfer output, trusted-UID rule, journal cursor I/O) and scenarios of the
-correlation state machine driven by a fake clock and a fake `wg show` (TCP
-attribution of long sessions and `tcp_candidates`, pending connects, same-key
-reconnects, empty peer set).
-
-**End-to-end test** — a *disposable* Linux machine with systemd (VM, WSL2, CI
-runner), as root:
-
-```bash
-sudo EDUVPN_E2E_DISPOSABLE=1 bash e2e_test.sh
-```
-
-It runs `install.sh` (three times, checking idempotency and that drop-ins
-survive), then drives the installed, sandboxed services with real components:
-WireGuard clients in network namespaces (UDP, roaming, and a TCP/ProxyGuard path
-through a loopback UDP relay that makes the server see `127.0.0.1`, with the
-START read from Apache's `error.log` by `proxyguard-watcher`), portal events
-written to journald as `www-data`, spoofing attempts from non-system UIDs, a
-forged START in a request path, a `wg_peers` portal DB, daemon restarts (journal
-replay, unusable cursor), `logrotate` and handshake-silence disconnects. It
-installs packages, a test user and a fake portal DB, so it refuses to run where
-`/var/lib/vpn-user-portal/db.sqlite` already exists. About 5 minutes.
 
 ## License
 
