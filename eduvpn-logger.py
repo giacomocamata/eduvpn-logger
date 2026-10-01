@@ -16,6 +16,7 @@ Configuration is read from environment variables (see CONFIG block below); all
 have sensible defaults, so the daemon also runs with no configuration at all.
 """
 import json
+import math
 import os
 import queue
 import re
@@ -38,6 +39,23 @@ except Exception:
     _syslog = None
 
 
+def _env_float(name: str, default: float) -> float:
+    # A malformed value in a drop-in must not crash-loop the daemon (every event
+    # would be lost): warn and keep the default.
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+        if math.isfinite(v):
+            return v
+    except ValueError:
+        pass
+    print(f"[eduvpn-logger] config: {name}={raw!r} is not a number; using {default:g}",
+          file=sys.stderr, flush=True)
+    return default
+
+
 # --------------------------------------------------------------------------- #
 # CONFIG — everything site-specific lives here, overridable via environment.   #
 # --------------------------------------------------------------------------- #
@@ -53,7 +71,7 @@ GEOIP_LANG = os.environ.get("EDUVPN_GEOIP_LANG", "en")
 SYSLOG_IDENT = os.environ.get("EDUVPN_SYSLOG_IDENT", "eduvpn-logger")
 SYSLOG_FACILITY = os.environ.get("EDUVPN_SYSLOG_FACILITY", "local0")
 # Floor: 0 would spawn `wg` in a busy loop, a negative value would kill the poller.
-WG_POLL_SEC = max(0.5, float(os.environ.get("EDUVPN_WG_POLL_SEC", "2.0")))
+WG_POLL_SEC = max(0.5, _env_float("EDUVPN_WG_POLL_SEC", 2.0))
 # Persistent state (the journald cursor). Give test instances their own directory.
 STATE_DIR = os.environ.get("EDUVPN_STATE_DIR", "/var/lib/eduvpn-logger")
 CURSOR_PATH = os.path.join(STATE_DIR, "journal.cursor")
@@ -104,6 +122,15 @@ def _is_global_ip(ip: str) -> bool:
     try:
         return ipaddress.ip_address(ip).is_global
     except Exception:
+        return False
+
+
+def _is_loopback(ip: Optional[str]) -> bool:
+    # ProxyGuard hands WireGuard its packets from a loopback address (127.0.0.1,
+    # or ::1 if proxyguard-server is set up that way): the client IP is hidden.
+    try:
+        return ipaddress.ip_address(ip or "").is_loopback
+    except ValueError:
         return False
 
 
@@ -233,7 +260,7 @@ WG_ROAMED_PREFIX = " roamed to "
 # but never below 180 s: WireGuard drops a session's keys 180 s after its handshake
 # (REJECT_AFTER_TIME) and a tunnel carrying traffic re-handshakes before that (every
 # ~120-165 s), so a shorter threshold would "disconnect" live sessions.
-_DISCONNECT_AFTER_ENV = float(os.environ.get("EDUVPN_DISCONNECT_AFTER_SEC", "180.0"))
+_DISCONNECT_AFTER_ENV = _env_float("EDUVPN_DISCONNECT_AFTER_SEC", 180.0)
 SYNTH_DISCONNECT_AFTER_SEC = max(180.0, _DISCONNECT_AFTER_ENV)
 # A peer is "active" while its last WireGuard handshake is within this window.
 # Capped at the disconnect threshold: a peer already past that threshold must never
@@ -242,11 +269,11 @@ SYNTH_DISCONNECT_AFTER_SEC = max(180.0, _DISCONNECT_AFTER_ENV)
 ACTIVE_HANDSHAKE_MAX_AGE_SEC = min(180.0, SYNTH_DISCONNECT_AFTER_SEC)
 # Defer a synthesized connect this long so the portal event / DB row can attribute it
 # to a user before we emit; we emit early as soon as it resolves. Overridable via env.
-CONNECT_GRACE_SEC = float(os.environ.get("EDUVPN_CONNECT_GRACE_SEC", "10.0"))
+CONNECT_GRACE_SEC = _env_float("EDUVPN_CONNECT_GRACE_SEC", 10.0)
 # Minimum gap between two roam events for the same peer. A roam where only the
 # source port changed (same IP — typical NAT rebind) is suppressed entirely;
 # this caps the rest so a flapping mobile NAT can't spam the SIEM. Env-overridable.
-ROAM_MIN_INTERVAL_SEC = float(os.environ.get("EDUVPN_ROAM_MIN_INTERVAL_SEC", "30.0"))
+ROAM_MIN_INTERVAL_SEC = _env_float("EDUVPN_ROAM_MIN_INTERVAL_SEC", 30.0)
 
 @dataclass(frozen=True)
 class TcpStartEvent:
@@ -521,6 +548,7 @@ class Correlator:
         # pubkey -> number of ProxyGuard starts its TCP source was chosen among.
         self._tcp_candidates: Dict[str, int] = {}
         self._warned_portal_format = False
+        self._wg_warned = False
         self._recent_lines: deque[str] = deque()
         self._recent_lines_set: set[str] = set()
 
@@ -553,7 +581,7 @@ class Correlator:
         ip, port = _split_endpoint(endpoint)
         if not ip:
             return "-", "-", "unknown"
-        if ip == "127.0.0.1":
+        if _is_loopback(ip):
             if not consume:
                 return "-", "-", "tcp"
             tcp = self._match_tcp_start(ts, pubkey)
@@ -755,6 +783,15 @@ class Correlator:
         # Called periodically by a background thread. The wg subprocess runs here
         # WITHOUT the lock; only the in-memory update + reconciliation are locked.
         snap, handshake, endpoint, ok = self._wg_dump()
+        if handshake is None:
+            # Once per outage, not every poll: without `wg show ... dump` (wg missing,
+            # no CAP_NET_ADMIN, timeout) nothing is derived from WireGuard.
+            if not self._wg_warned:
+                self._wg_warned = True
+                _log_err("wg poller", RuntimeError(
+                    "`wg show all dump` failed: no connect/roam/disconnect from WireGuard until it works"))
+        else:
+            self._wg_warned = False
         if not ok:
             # wg show failed this cycle: don't act on absent data (it would synth a
             # disconnect for every live peer), but time-based pruning is always safe.
@@ -837,14 +874,23 @@ class Correlator:
                 # Suppress port-only changes (same IP — typical NAT rebind) and
                 # rate-limit the rest, so a flapping mobile NAT can't spam the SIEM.
                 prev_ip, _prev_port = _split_endpoint(prev)
-                new_ip, _new_port = _split_endpoint(endpoint)
+                new_ip, new_port = _split_endpoint(endpoint)
                 # Port-only change on a real (non-loopback) IP = NAT rebind -> suppress.
-                # For TCP/ProxyGuard the raw IP is always 127.0.0.1, so the real client
+                # For TCP/ProxyGuard the raw IP is always loopback, so the real client
                 # IP is hidden: treat any endpoint change as a roam candidate.
-                real_roam = (new_ip == "127.0.0.1") or (prev_ip != new_ip)
+                real_roam = _is_loopback(new_ip) or (prev_ip != new_ip)
                 if real_roam and (now - self._roam_last.get(pubkey, 0.0)) >= ROAM_MIN_INTERVAL_SEC:
                     self._roam_last[pubkey] = now
                     self._handle_wg_event_locked(now, f"{pubkey} roamed to {endpoint}")
+                elif _is_loopback(new_ip):
+                    # No roam line, but a new ProxyGuard tunnel still claims its start
+                    # (or it could be matched to another client) and the disconnect
+                    # line must carry the current source.
+                    tcp = self._match_tcp_start(now, pubkey)
+                    if tcp is not None:
+                        self._pubkey_src[pubkey] = (now, tcp.src_ip, tcp.src_port, "tcp")
+                elif new_ip:
+                    self._pubkey_src[pubkey] = (now, new_ip, new_port or "-", "udp")
 
         # A peer whose handshake has gone silent past the threshold is treated as
         # disconnected. For app sessions the portal DISCONNECT normally fires first
@@ -872,12 +918,10 @@ class Correlator:
         if base is None:
             return str(now_rx), str(now_tx)
         base_rx, base_tx = base
-        d_rx = now_rx - base_rx
-        d_tx = now_tx - base_tx
-        if d_rx < 0:
-            d_rx = 0
-        if d_tx < 0:
-            d_tx = 0
+        # A counter below its baseline means the peer was re-created (e.g. a
+        # vpn-daemon restart) and counts from 0 again: report what came after.
+        d_rx = now_rx - base_rx if now_rx >= base_rx else now_rx
+        d_tx = now_tx - base_tx if now_tx >= base_tx else now_tx
         return str(d_rx), str(d_tx)
 
     def _prune(self, now_ts: float) -> None:
@@ -902,7 +946,7 @@ class Correlator:
                     # Session already announced; don't emit a second connect.
                     self._pending_connect.pop(pubkey, None)
                     continue
-                src_ip, src_port, transport = self._wg_peer_endpoint(now_ts, pubkey, consume=True)
+                src_ip, src_port, transport = self._pending_source(pubkey, ts)
                 self._emit_connect(ev, src_ip, src_port, transport)
                 self._emitted_connect_ts[pubkey] = now_ts
                 self._pending_connect.pop(pubkey, None)
@@ -921,6 +965,19 @@ class Correlator:
             # a DISCONNECT would otherwise be kept for the daemon's whole lifetime.
             if info.ts < cutoff_emitted and pubkey not in self._virtual_peers and pubkey not in self._pending_connect:
                 self._conn_info.pop(pubkey, None)
+
+    def _pending_source(self, pubkey: str, held_ts: float) -> Tuple[str, str, str]:
+        # Source for a held connect being written: the one already known, else a
+        # ProxyGuard start matched at the time the connect was held (handshake or
+        # portal event), not now — a start seconds later is another client's.
+        # Recorded, so the disconnect line carries it too.
+        cur = self._pubkey_src.get(pubkey)
+        if cur is not None and cur[1] != "-":
+            return cur[1], cur[2], cur[3]
+        src_ip, src_port, transport = self._wg_peer_endpoint(held_ts, pubkey, consume=True)
+        if transport != "unknown":
+            self._pubkey_src[pubkey] = (held_ts, src_ip, src_port, transport)
+        return src_ip, src_port, transport
 
     def _match_tcp_start(self, now_ts: float, pubkey: str) -> Optional[TcpStartEvent]:
         # Closest start in time. A start may be stamped slightly *after* the WG
@@ -968,14 +1025,22 @@ class Correlator:
             if pubkey and ip is None:
                 self._prune_locked(ts)
                 return
-            if ip == "127.0.0.1":
-                tcp = self._match_tcp_start(ts, pubkey)
+            if _is_loopback(ip):
+                cur = self._pubkey_src.get(pubkey)
+                tcp = None
+                if cur is not None and cur[3] == "tcp" and cur[1] != "-":
+                    pass  # already attributed (portal path): another start would be someone else's
+                else:
+                    tcp = self._match_tcp_start(ts, pubkey)
                 if tcp is not None:
                     self._pubkey_src[pubkey] = (ts, tcp.src_ip, tcp.src_port, "tcp")
-                else:
+                elif cur is None or cur[1] == "-":
                     self._pubkey_src[pubkey] = (ts, "-", "-", "tcp")
-                    if pubkey not in self._emitted_connect_ts and pubkey not in self._pending_connect:
-                        info = self._conn_info.get(pubkey)
+                    if pubkey not in self._emitted_connect_ts:
+                        # No start yet: hold the connect (the portal's, if it already
+                        # announced the session) and let the prune retry the match.
+                        pending = self._pending_connect.get(pubkey)
+                        info = pending[1] if pending is not None else self._conn_info.get(pubkey)
                         if info is None:
                             db = self._db.lookup(pubkey)
                             if db is None:
@@ -1029,14 +1094,14 @@ class Correlator:
             else:
                 _old_ts, src_ip_old, src_port_old, transport = old
 
-            if ip == "127.0.0.1":
+            if _is_loopback(ip):
                 transport = "tcp"
                 tcp = self._match_tcp_start(ts, pubkey)
                 if tcp is not None:
                     ip = tcp.src_ip
                     port = tcp.src_port
                 else:
-                    if src_ip_old not in ("-", "127.0.0.1"):
+                    if src_ip_old != "-" and not _is_loopback(src_ip_old):
                         ip = src_ip_old
                         port = src_port_old
                     else:
@@ -1109,9 +1174,9 @@ class Correlator:
                 src = self._pubkey_src.get(pubkey)
                 if src is None:
                     ip, port = _split_endpoint(endpoint)
-                    if ip and ip != "127.0.0.1":
+                    if ip and not _is_loopback(ip):
                         src_ip, src_port, transport = ip, port or "-", "udp"
-                    elif ip == "127.0.0.1":
+                    elif ip:
                         # Never time-match a start here (see _wg_peer_endpoint).
                         src_ip, src_port, transport = "-", "-", "tcp"
                     else:
@@ -1180,7 +1245,9 @@ class Correlator:
             src = self._pubkey_src.get(conn)
             if src is None or (ts - src[0]) > 60.0:
                 src_ip, src_port, transport = self._wg_peer_endpoint(ts, conn, consume=True)
-                if transport != "unknown":
+                # A TCP peer without its ProxyGuard start yet is held like an
+                # unseen one: the prune retries the match before writing it.
+                if src_ip != "-":
                     self._pubkey_src[conn] = (ts, src_ip, src_port, transport)
                     if conn not in self._emitted_connect_ts:
                         self._emit_connect(ev, src_ip, src_port, transport)
@@ -1192,7 +1259,7 @@ class Correlator:
                 return
 
             _ts2, src_ip, src_port, transport = src
-            if transport == "tcp" and (src_ip == "-" or src_ip == "127.0.0.1"):
+            if transport == "tcp" and (src_ip == "-" or _is_loopback(src_ip)):
                 self._pending_connect[conn] = (ts, ev)
                 self._prune_locked(ts)
                 return
@@ -1227,10 +1294,8 @@ class Correlator:
             if pending is not None and conn not in self._emitted_connect_ts:
                 # The portal announced it but it never resolved (e.g. no handshake):
                 # write the connect now so it precedes its disconnect.
-                c_ip, c_port, c_transport = self._wg_peer_endpoint(ts, conn, consume=True)
+                c_ip, c_port, c_transport = self._pending_source(conn, pending[0])
                 self._emit_connect(pending[1], c_ip, c_port, c_transport)
-                if c_transport != "unknown":
-                    self._pubkey_src[conn] = (ts, c_ip, c_port, c_transport)
             src = self._pubkey_src.get(conn)
             if src is None:
                 src_ip, src_port, transport = self._wg_peer_endpoint(ts, conn)
@@ -1310,11 +1375,13 @@ def _reader_journal(q: "queue.Queue[Tuple[str, float, Optional[str], Optional[st
     uid_max = _sys_uid_max()
     cursor = _load_cursor()
     rejected_uids: set[str] = set()
+    failing = False  # warn once per outage, not once a second
     while True:
         p = None
         got_entry = False
         try:
-            p = subprocess.Popen(_portal_journal_cmd(cursor), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            p = subprocess.Popen(_portal_journal_cmd(cursor), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 text=True, errors="replace")
             assert p.stdout is not None
             for line in p.stdout:
                 line = line.strip()
@@ -1325,6 +1392,7 @@ def _reader_journal(q: "queue.Queue[Tuple[str, float, Optional[str], Optional[st
                 except Exception:
                     continue
                 got_entry = True
+                failing = False
                 c = entry.get("__CURSOR")
                 if isinstance(c, str) and c:
                     cursor = c
@@ -1352,8 +1420,14 @@ def _reader_journal(q: "queue.Queue[Tuple[str, float, Optional[str], Optional[st
                     os.remove(CURSOR_PATH)
                 except OSError:
                     pass
+            elif rc != 0 and not got_entry and not failing:
+                failing = True
+                _log_err("journal reader", RuntimeError(
+                    f"journalctl rc={rc}: no portal events until it works (retrying every second)"))
         except Exception as e:
-            _log_err("journal reader (portal)", e)
+            if not failing:
+                failing = True
+                _log_err("journal reader (portal)", e)
         finally:
             if p is not None:
                 try:
@@ -1368,7 +1442,7 @@ def _reader_proxyguard_start(q: "queue.Queue[Tuple[str, float, Optional[str], Op
     while True:
         p = None
         try:
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
             assert p.stdout is not None
             for raw in p.stdout:
                 line = raw.strip()
@@ -1402,6 +1476,9 @@ def _wg_poller(corr: Correlator) -> None:
 class GeoIp:
     def __init__(self) -> None:
         self._reader = None
+        self._path = ""
+        self._mtime = 0.0
+        self._next_check = 0.0
         self._langs = [s.strip() for s in GEOIP_LANG.split(",") if s.strip()] or ["en"]
         try:
             import maxminddb  # type: ignore
@@ -1410,18 +1487,42 @@ class GeoIp:
                 # The operator explicitly asked for GeoIP: don't fail silently.
                 _log_err("geoip", RuntimeError("EDUVPN_GEOIP_DB is set but the maxminddb module is not installed"))
             return
+        self._open_database = maxminddb.open_database
 
         paths = (GEOIP_DB,) if GEOIP_DB else GEOIP_DEFAULT_PATHS
         for p in paths:
-            try:
-                if p and os.path.exists(p):
-                    self._reader = maxminddb.open_database(p)  # type: ignore
-                    return
-            except Exception as e:
-                self._reader = None
-                _log_err("geoip", RuntimeError(f"cannot open GeoIP database {p}: {e!r}"))
+            if p and os.path.exists(p) and self._open(p):
+                return
         if GEOIP_DB and self._reader is None:
             _log_err("geoip", FileNotFoundError(GEOIP_DB))
+
+    def _open(self, path: str) -> bool:
+        try:
+            mtime = os.stat(path).st_mtime
+            self._reader = self._open_database(path)
+            self._path, self._mtime = path, mtime
+            return True
+        except Exception as e:
+            _log_err("geoip", RuntimeError(f"cannot open GeoIP database {path}: {e!r}"))
+            return False
+
+    def _maybe_reload(self) -> None:
+        # geoipupdate replaces the file (weekly, typically) while the open reader
+        # keeps serving the old data: reopen it when it changes, checked hourly.
+        now = time.time()
+        if not self._path or now < self._next_check:
+            return
+        self._next_check = now + 3600.0
+        try:
+            changed = os.stat(self._path).st_mtime != self._mtime
+        except OSError:
+            return  # mid-replacement or removed: keep the reader we have
+        old = self._reader
+        if changed and self._open(self._path) and old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
 
     def _name(self, node: object) -> Optional[str]:
         if not isinstance(node, dict):
@@ -1436,6 +1537,7 @@ class GeoIp:
         return None
 
     def lookup(self, ip: str) -> Tuple[Optional[str], Optional[str]]:
+        self._maybe_reload()
         if self._reader is None or not _is_global_ip(ip):
             return None, None
         try:

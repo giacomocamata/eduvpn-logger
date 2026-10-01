@@ -204,7 +204,9 @@ few seconds of the tunnel coming up. Warnings from the daemon are in
 
 All settings are environment variables with defaults for a standard Debian
 eduVPN server. Change them with a systemd drop-in, which survives re-installs
-(the unit file itself lists every variable for reference):
+(the unit file itself lists every variable for reference). A value that is not
+a number is ignored with a warning in `journalctl -u eduvpn-logger`, and the
+default is used:
 
 ```bash
 sudo systemctl edit eduvpn-logger.service

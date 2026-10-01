@@ -206,7 +206,9 @@ l'utente e l'IP pubblico di provenienza. Gli avvisi del daemon sono in
 
 Tutte le impostazioni sono variabili d'ambiente con default adatti a un server
 eduVPN Debian standard. Modificale con un drop-in systemd, che sopravvive alle
-reinstallazioni (il file della unit elenca tutte le variabili come riferimento):
+reinstallazioni (il file della unit elenca tutte le variabili come riferimento).
+Un valore che non è un numero viene ignorato con un avviso in
+`journalctl -u eduvpn-logger`, e si usa il default:
 
 ```bash
 sudo systemctl edit eduvpn-logger.service

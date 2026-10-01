@@ -38,8 +38,10 @@ def parse_line(line: str) -> Optional[Tuple[str, str]]:
 
 
 def main() -> None:
-    for line in sys.stdin:
-        parsed = parse_line(line)
+    # Bytes, decoded leniently: one invalid UTF-8 sequence in Apache's log must
+    # not crash the watcher (strict decoding of stdin would).
+    for raw in sys.stdin.buffer:
+        parsed = parse_line(raw.decode("utf-8", "replace"))
         if parsed is None:
             continue
         ip, port = parsed
