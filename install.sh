@@ -43,7 +43,26 @@ UPGRADE=0
 
 echo "==> Installing systemd units to $UNITS"
 # Units are overwritten on re-run: customise them with `systemctl edit <unit>`
-# (drop-ins survive), not by editing these files.
+# (drop-ins survive), not by editing these files. The first release said to edit
+# them in place, so carry such settings over into a drop-in first: losing the
+# watcher's ErrorLog path would silently cost every TCP session its source IP.
+# 00-migrated.conf sorts before override.conf: existing drop-ins still win.
+keep_local_settings() {
+    local unit="$UNITS/$1" lines cmd
+    lines=$(grep -s '^Environment=' "$unit" | grep -vxF -f "$SRC/systemd/$1" || true)
+    cmd=$(grep -s '^ExecStart=' "$unit" | tail -n 1 || true)
+    if [ "$1" = proxyguard-watcher.service ] && [ -n "$cmd" ] && [[ $cmd != *" /var/log/apache2/error.log "* ]]; then
+        # `-n 0` (missing in old units): a restart must not replay old lines as
+        # fresh START events.
+        lines+=$'\nExecStart=\n'"${cmd/tail -F /tail -n 0 -F }"
+    fi
+    [ -n "$lines" ] || return 0
+    install -d "$unit.d"
+    printf '[Service]\n%s\n' "$lines" >>"$unit.d/00-migrated.conf"
+    echo "WARN: settings edited into $unit kept in $unit.d/00-migrated.conf" >&2
+}
+keep_local_settings eduvpn-logger.service
+keep_local_settings proxyguard-watcher.service
 install -m 0644 "$SRC/systemd/eduvpn-logger.service" "$UNITS/eduvpn-logger.service"
 install -m 0644 "$SRC/systemd/proxyguard-watcher.service" "$UNITS/proxyguard-watcher.service"
 
@@ -51,8 +70,12 @@ echo "==> Creating /var/log/eduvpn (2750 root:adm: the logs hold personal data)"
 # setgid: files created in it (by the daemon, rsyslog) belong to group adm too.
 install -d -m 2750 -o root -g adm /var/log/eduvpn
 
-echo "==> Installing logrotate policy"
-install -m 0644 "$SRC/examples/logrotate-eduvpn" /etc/logrotate.d/eduvpn-logger
+if [ -d /etc/logrotate.d ]; then
+    echo "==> Installing logrotate policy"
+    install -m 0644 "$SRC/examples/logrotate-eduvpn" /etc/logrotate.d/eduvpn-logger
+else
+    echo "WARN: logrotate not installed: /var/log/eduvpn will not be rotated (install it, re-run)" >&2
+fi
 
 if [ -d /etc/rsyslog.d ] && grep -qs '^[$]PrivDropToUser' /etc/rsyslog.conf; then
     # Ubuntu: rsyslog runs as user syslog and cannot write into the root:adm

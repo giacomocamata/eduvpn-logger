@@ -38,14 +38,17 @@ WireGuard has no notion of a connection, so events are derived from the polled
 peer state:
 
 - **connect**: a peer completes a handshake on a new endpoint. The line is held
-  for up to 10 s until the portal event or the portal DB names the user.
+  for up to 10 s until the portal event or the portal DB names the user. A
+  session announced by the portal is written at its first handshake, so with
+  its source; with no handshake within 2 minutes it is written without one.
 - **roam**: the source IP of an active peer changes. Port-only changes (NAT
   rebinding) are ignored; roams are limited to one per peer every 30 s.
 - **disconnect**: taken from the portal's DISCONNECT when the eduVPN app
   disconnects; otherwise (generic WireGuard client, or an idle tunnel) emitted
   after 180 s without a handshake, WireGuard's key lifetime.
 
-Lines not backed by a portal event carry **`inferred=1`**. With ProxyGuard the
+Connect and disconnect lines not backed by a portal event carry
+**`inferred=1`** (roam lines always come from WireGuard). With ProxyGuard the
 kernel sees every client as `127.0.0.1`: the real IP is taken from the Apache
 tunnel-start event closest in time, and `tcp_candidates` reports how many
 starts were candidates (see [Limitations](#limitations)).
@@ -235,6 +238,7 @@ sudo systemctl restart eduvpn-logger.service
 | `EDUVPN_CONNECT_GRACE_SEC` | `10.0` | max wait for user attribution before writing a connect |
 | `EDUVPN_DISCONNECT_AFTER_SEC` | `180.0` | handshake silence before an inferred disconnect; values below 180 are raised to 180 |
 | `EDUVPN_ROAM_MIN_INTERVAL_SEC` | `30.0` | minimum interval between roam lines per peer |
+| `EDUVPN_WG_INTERFACES` | *(all)* | WireGuard interfaces to follow, comma-separated, e.g. `wg0`; set it if the server runs other WireGuard tunnels |
 
 The syslog copy goes to the journal (`journalctl -t eduvpn-logger`) and, with
 rsyslog, to `/var/log/eduvpn/eduvpn-syslog.log`; forward it to your SIEM from
@@ -264,7 +268,7 @@ inject extra keys. New keys may be added in future versions: ignore unknown ones
 | `transport` | all | `udp`, `tcp` (ProxyGuard) or `unknown` |
 | `tcp_candidates` | connect, roam over `tcp` | tunnel starts the source IP was chosen among; `1` = unambiguous |
 | `bytes_in`, `bytes_out` | disconnect | seen from the server (`in` = sent by the client); from the portal, or WireGuard counters for inferred disconnects |
-| `inferred` | when `1` | derived from WireGuard state, not reported by the portal |
+| `inferred` | connect, disconnect | `1`: derived from WireGuard state, not reported by the portal |
 | `country`, `city` | with GeoIP, public IPs | location of `src_ip` |
 
 ## Limitations
@@ -300,9 +304,10 @@ legal basis and retention with your Data Protection Officer.
   evidential use, forward the syslog stream to a remote collector in real time
   (rsyslog `omfwd` over TLS, or RELP).
 - **Privileges**: both services run as root inside a systemd sandbox.
-  `eduvpn-logger` keeps only `CAP_NET_ADMIN` (`wg show`) and
-  `CAP_DAC_READ_SEARCH`/`CAP_DAC_OVERRIDE` (reading the portal DB);
-  `proxyguard-watcher` has no capabilities and no network. Inspect with
+  `eduvpn-logger` keeps only `CAP_NET_ADMIN` (`wg show`),
+  `CAP_DAC_READ_SEARCH`/`CAP_DAC_OVERRIDE` (reading the portal DB) and
+  `CAP_CHOWN` (a WAL-mode DB gets `-wal`/`-shm` files that must belong to the
+  portal); `proxyguard-watcher` has no capabilities and no network. Inspect with
   `systemd-analyze security eduvpn-logger.service`.
 
 ## Upgrade and removal
@@ -313,6 +318,10 @@ service you stopped or disabled is left alone):
 ```bash
 cd eduvpn-logger && git pull && sudo ./install.sh
 ```
+
+Settings that an older version had you edit directly into the unit files
+(`Environment=` lines, the watcher's `ErrorLog` path) are moved to
+`<unit>.d/00-migrated.conf` before the units are replaced.
 
 Removal (logs in `/var/log/eduvpn` are left in place):
 

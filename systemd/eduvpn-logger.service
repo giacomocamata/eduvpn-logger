@@ -11,8 +11,9 @@ RestartSec=2
 # Runs as root, but contained. It only needs: CAP_NET_ADMIN for `wg show`, and
 # CAP_DAC_READ_SEARCH + CAP_DAC_OVERRIDE to open the portal DB (www-data, 0600)
 # read-only — OVERRIDE because a read-only reader of a WAL-mode SQLite DB must
-# still create its -shm file.
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+# still create its -wal/-shm files — and CAP_CHOWN, with which SQLite hands
+# those files to the DB owner: left root-owned, they lock the portal out of its DB.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN
 # New files (the log) are 0640: they hold personal data.
 UMask=0027
 # /var/lib/eduvpn-logger: journald cursor, so portal events logged while the
@@ -54,6 +55,8 @@ SystemCallFilter=@system-service
 #Environment=EDUVPN_CONNECT_GRACE_SEC=10.0
 #Environment=EDUVPN_ROAM_MIN_INTERVAL_SEC=30.0
 #Environment=EDUVPN_STATE_DIR=/var/lib/eduvpn-logger
+# Default: every WireGuard interface. Restrict it if the host has others.
+#Environment=EDUVPN_WG_INTERFACES=wg0
 
 [Install]
 WantedBy=multi-user.target
