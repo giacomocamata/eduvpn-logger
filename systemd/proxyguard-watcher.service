@@ -5,8 +5,33 @@ Wants=apache2.service
 
 [Service]
 Type=simple
-# Adjust the error-log path to your VirtualHost's ErrorLog.
-ExecStart=/bin/sh -c 'exec tail -F /var/log/apache2/error.log | python3 -u /usr/local/sbin/proxyguard-watcher.py'
+# Adjust the error-log path to your VirtualHost's ErrorLog via
+# `sudo systemctl edit proxyguard-watcher` (an empty `ExecStart=` line first,
+# then the new one). `-n 0`: never replay old lines as fresh START events.
+# Reads one root-owned log and appends to another: no capabilities, no network.
+CapabilityBoundingSet=
+UMask=0027
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=none
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ExecStart=/bin/sh -c 'exec tail -n 0 -F /var/log/apache2/error.log | python3 -u /usr/local/sbin/proxyguard-watcher.py'
 Restart=always
 RestartSec=2
 
