@@ -2,232 +2,209 @@
 
 *🇮🇹 [Leggi in italiano](README.it.md)*
 
-**Unified, correlated session logging for [eduVPN v3](https://www.eduvpn.org/) (WireGuard).**
+**Correlated session logging for [eduVPN v3](https://www.eduvpn.org/) servers using WireGuard.**
 
-## Motivation
-
-In an eduVPN v3 deployment, the facts that describe a single VPN session are
-scattered across three independent log sources, and **no source alone is
-sufficient** to answer the operationally and forensically essential question
-*"who connected, from where, and when?"*:
-
-| Source | Provides | Where |
-|---|---|---|
-| `vpn-user-portal` | identity: user, profile, WG public key, assigned VPN IPs, transferred bytes | journald (`-t vpn-user-portal`) |
-| **WireGuard** (`wg show`) | network endpoint: WG public key ↔ **public source IP:port**; liveness | polled internally |
-| Apache **ProxyGuard** | public source IP:port for TCP-443 fallback sessions | file (`proxyguard_start.log`) |
-
-The portal records *who* authenticated but never the public address they came
-from; WireGuard, being a stateless protocol with no notion of a "connection",
-knows the source endpoint but silently rebinds it on roaming and logs nothing.
-Bridging the two is therefore a correlation problem, and the **WireGuard public
-key** is the only identifier shared by all three sources.
-
-`eduvpn-logger` is a single-file Python daemon (standard library only) that
-performs this correlation in real time and emits **one structured `key=value`
-line per session event** — `connect`, `roam`, `disconnect` — to a log file and,
-in parallel, to syslog for SIEM ingestion:
+On an eduVPN server no single log answers *"which user connected, from which
+public IP, and when?"*: the portal knows the user but not the source address,
+WireGuard knows the source address but not the user and logs nothing.
+`eduvpn-logger` joins the two in real time and writes **one `key=value` line per
+session event** (`connect`, `roam`, `disconnect`) to a file and to syslog, ready
+for a SIEM:
 
 ```
 2026-04-15T09:58:03.412871+02:00 event=connect user=alice profile=staff device=ios conn=soAQTNO...= tunnel_ip4="10.20.0.5" tunnel_ip6="fd00:20::5" src_ip="203.0.113.45" src_port=48049 transport=udp country="Italy" city="Trieste"
 2026-04-15T10:41:22.090113+02:00 event=roam user=alice profile=staff device=ios conn=soAQTNO...= tunnel_ip4="10.20.0.5" tunnel_ip6="fd00:20::5" src_ip_old="203.0.113.45" src_port_old=48049 src_ip="198.51.100.12" src_port=51234 transport=udp
 2026-04-15T11:02:57.731204+02:00 event=disconnect user=alice profile=staff device=ios conn=soAQTNO...= bytes_in=227252 bytes_out=49292 src_ip="198.51.100.12" src_port=51234 transport=udp
-2026-04-15T12:10:05.000000+02:00 event=connect user=bob profile=staff conn=GUUepz8z...= tunnel_ip4="10.20.0.9" tunnel_ip6="fd00:20::9" src_ip="192.0.2.77" src_port=40112 transport=tcp inferred=1
+2026-04-15T12:10:05.000000+02:00 event=connect user=bob profile=staff conn=GUUepz8z...= tunnel_ip4="10.20.0.9" tunnel_ip6="fd00:20::9" src_ip="192.0.2.77" src_port=40112 transport=tcp tcp_candidates=1 inferred=1
 ```
 
-(Country/city appear only when GeoIP is configured and the source IP is public.)
+A single-file Python daemon (standard library only), running in production at
+the University of Trieste. Only **WireGuard** sessions are handled: for OpenVPN
+the portal already logs the source IP itself.
 
-> **Scope.** Only **WireGuard** sessions are correlated. OpenVPN is deliberately
-> excluded: eduVPN's native OpenVPN logs already expose user, profile, and public
-> source IP in a single record, so no additional correlation is warranted there.
+## How it works
 
-## Design highlights
+The daemon reads the following sources and joins them on the **WireGuard
+public key**, the only identifier they share:
 
-The daemon was extracted from a production deployment (University of Trieste)
-and generalised. Its design rests on four decisions worth emphasising:
+| Source | What it provides | How it is read |
+|---|---|---|
+| `vpn-user-portal` | user, profile, public key, tunnel IPs, byte counters | journald, `SYSLOG_IDENTIFIER=vpn-user-portal` |
+| portal database | user/profile/device for a public key (fallback) | `/var/lib/vpn-user-portal/db.sqlite`, table `wg_peers`, read-only |
+| WireGuard | public key → public source `IP:port`, last handshake | `wg show all dump`, every 2 s |
+| ProxyGuard *(optional)* | real client `IP:port` of TCP/443 sessions | Apache `ErrorLog` → `proxyguard-watcher` → `proxyguard_start.log` |
 
-- **Correlation keyed on the WireGuard public key.** Identity (from the portal)
-  and network endpoint (from WireGuard / ProxyGuard) are joined on the one stable
-  identifier they share, so the linkage holds even across endpoint roaming and
-  across the TCP fallback path.
+WireGuard has no notion of a connection, so events are derived from the polled
+peer state:
 
-- **WireGuard events are synthesised internally — no external logger.** WireGuard
-  exposes no connect/disconnect notion, so these have to be inferred. The widely
-  used [`wglogger`](https://codeberg.org/flaruina/wglogger) infers them from
-  conntrack netlink events but, to map a flow back to a peer, ultimately queries
-  the same `wg show` data this daemon already polls. The dependency is therefore
-  redundant: `eduvpn-logger` reconstructs the events itself from periodic
-  snapshots, leaving nothing extra to install or keep alive.
+- **connect**: a peer completes a handshake on a new endpoint. The line is held
+  for up to 10 s until the portal event or the portal DB names the user.
+- **roam**: the source IP of an active peer changes. Port-only changes (NAT
+  rebinding) are ignored; roams are limited to one per peer every 30 s.
+- **disconnect**: taken from the portal's DISCONNECT when the eduVPN app
+  disconnects; otherwise (generic WireGuard client, or an idle tunnel) emitted
+  after 180 s without a handshake, WireGuard's key lifetime.
 
-- **Graceful degradation.** Every enrichment is optional and fails safe. With no
-  GeoIP database the `country`/`city` fields are simply omitted; when a session
-  carries no portal CONNECT event, user and profile are recovered from the portal
-  SQLite DB (read-only) by public key. The portal schema is auto-detected by
-  column name, so the tool adapts across eduVPN versions without configuration.
+Lines not backed by a portal event carry **`inferred=1`**. With ProxyGuard the
+kernel sees every client as `127.0.0.1`: the real IP is taken from the Apache
+tunnel-start event closest in time, and `tcp_candidates` reports how many
+starts were candidates (see [Limitations](#limitations)).
 
-- **SIEM-safe output.** User- and profile-derived fields are sanitised before
-  serialisation, so a hostile value from the IdP or portal cannot break the line
-  format or forge spurious key=value pairs. Roaming events that reflect mere NAT
-  port rebinds are suppressed, and the rest are rate-limited per peer to avoid
-  flooding the SIEM from flapping mobile clients.
-
-## How WireGuard events are derived
-
-Because WireGuard has no connection concept, every `EDUVPN_WG_POLL_SEC` seconds
-the daemon reads each peer's endpoint and last-handshake time from `wg show` and
-derives:
-
-- **connect** — a peer becomes active (recent handshake) on a new endpoint. The
-  event is briefly deferred (`EDUVPN_CONNECT_GRACE_SEC`, default 10 s) and emitted
-  as soon as the portal event or the portal DB attributes the peer to a user, so
-  attributable sessions are never logged with `user=-`.
-- **roam** — an active peer's endpoint changes (subject to the throttling above).
-- **disconnect** — when the eduVPN app disconnects, the portal's own DISCONNECT
-  is used directly (with the portal's byte counters). Otherwise — a **WireGuard
-  profile imported into a generic WireGuard client**, or *any* peer, app
-  included, that stays silent — the disconnect is synthesised once the handshake
-  has been silent for `EDUVPN_DISCONNECT_AFTER_SEC` (default 180 s ≈ 3 minutes);
-  WireGuard re-handshakes at least every ~2 minutes while traffic flows, so
-  silence means the tunnel is idle or gone. Such a line carries `inferred=1` and
-  arrives about three minutes after the client stops; if the peer becomes active
-  again, a new `connect` follows.
-
-Every line that is **not** backed by a portal event (a connect seen only in
-WireGuard and attributed through the portal DB, or a disconnect from handshake
-silence) is marked `inferred=1`, so a SIEM can tell observed from derived facts.
-
-The trade-off against a netlink-based logger is resolution: detection happens at
-the poll granularity (default 2 s) rather than instantaneously, and a session
-shorter than one poll interval may be missed. For eduVPN's long-lived sessions
-this is immaterial; lower `EDUVPN_WG_POLL_SEC` if finer granularity is required.
-
-**Restarts.** The daemon persists its position in the journal (the journald
-cursor, in `EDUVPN_STATE_DIR`, default `/var/lib/eduvpn-logger`). On start it
-resumes right after the last portal entry it processed, so CONNECT/DISCONNECT
-events logged while it was down are **replayed with their original
-timestamps** (delivery is at-least-once: a crash between processing an entry and
-saving the cursor can repeat that one entry). If the saved cursor is unusable
-(journal vacuumed, machine-id changed) it logs a warning and starts from "now".
-
-Session state itself is in memory: after a restart, peers that are still active
-are re-announced with a `connect` line marked `inferred=1` (timestamped with
-their latest handshake, byte counters restarting from there); for TCP sessions
-the original ProxyGuard source is not recoverable, so that line has
-`src_ip="-"` — the pre-restart `connect` line carries it.
+The daemon saves its journal position in `/var/lib/eduvpn-logger`: portal
+events logged while it was stopped are processed on the next start, with their
+original timestamps.
 
 ## Requirements
 
-- Linux with `systemd`, `journalctl`, and the `wg` tool (`wireguard-tools`).
-- An eduVPN v3 deployment (`vpn-user-portal`) using WireGuard.
-- Python 3.9+ (standard library only). GeoIP enrichment needs `maxminddb`.
-- *Optional:* Apache with ProxyGuard (eduVPN's TCP-443 fallback) — only needed to
-  attribute the real source IP of TCP-fallback sessions; UDP-only deployments can
-  skip it entirely (see below).
+- eduVPN v3 server (`vpn-user-portal`) with WireGuard, on a systemd-based Linux.
+  Tested on Debian/Ubuntu; Fedora/EL need the path adjustments noted below.
+- `wireguard-tools` (`wg`) and Python ≥ 3.9, standard library only (both
+  installed by `install.sh`).
+- *Optional:* `python3-maxminddb` and a MaxMind GeoLite2-City database for
+  `country`/`city`.
 
-## Quick start
+## Installation
 
-```bash
-git clone https://github.com/giacomocamata/eduvpn-logger.git
-cd eduvpn-logger
-chmod +x install.sh
-sudo ./install.sh
-```
+### 1. Enable portal connection logging (required)
 
-`install.sh` is idempotent: it installs dependencies, copies both scripts to
-`/usr/local/sbin`, installs both systemd units (enabling `eduvpn-logger`), creates
-`/var/log/eduvpn`, and drops the logrotate policy and (if rsyslog is present)
-the rsyslog snippet. When it finishes, the
-`eduvpn-logger` daemon is **already running** with default settings — verify with
-`journalctl -fu eduvpn-logger.service`. To complete the setup, follow the
-post-install steps below. For a manual install, see
-[Manual install](#manual-install).
-
-## Post-install steps
-
-`install.sh` configures everything it safely can; the rest depends on your site
-and is done by hand. Step 1 is required; UDP-only deployments without GeoIP can
-skip steps 2–3 and keep the defaults of step 4.
-
-### 1. Portal logging (required)
-
-The portal must write its CONNECT/DISCONNECT events to syslog. In
-`/etc/vpn-user-portal/config.php`:
+In `/etc/vpn-user-portal/config.php`, inside the `Log` section:
 
 ```php
 'Log' => [
     'syslogConnectionEvents' => true,
-    // Recommended (vpn-user-portal >= 3.5.0): key=value templates, which also
-    // carry the portal's byte counters on disconnect.
+    // recommended (vpn-user-portal >= 3.5.0): parsed reliably and carries byte counters
     'connectLogTemplate'    => 'CONNECT USER={{USER_ID}} PROFILE={{PROFILE_ID}} PROTO={{VPN_PROTO}} CONN={{CONNECTION_ID}} IP4={{IP_FOUR}} IP6={{IP_SIX}}',
     'disconnectLogTemplate' => 'DISCONNECT USER={{USER_ID}} PROFILE={{PROFILE_ID}} PROTO={{VPN_PROTO}} CONN={{CONNECTION_ID}} BYTES_IN={{BYTES_IN}} BYTES_OUT={{BYTES_OUT}}',
 ],
 ```
 
-then `sudo vpn-maint-apply-changes`. Without the templates the portal's default
-format is parsed too, but its DISCONNECT has no byte counters. Custom templates
-must keep the `USER=`, `PROFILE=`, `CONN=` keys (and `IP4=`/`IP6=`, `BYTES_IN=`/
-`BYTES_OUT=`); events whose `CONN` is not a WireGuard public key (OpenVPN) are
-ignored. Only entries logged by a system account (root, `www-data`, `apache`, …:
-UID ≤ `SYS_UID_MAX`) are trusted — see [Limitations](#limitations-and-threat-model).
+The setting is read on the next portal request; `vpn-maint-apply-changes` is not
+needed. Without the two templates the portal's default format is used and also
+understood, but disconnects then carry no byte counters. Custom templates must
+keep the `USER=`, `PROFILE=` and `CONN=` keys. Reference:
+[eduVPN logging](https://docs.eduvpn.org/server/v3/logging.html).
 
-### 2. Apache / ProxyGuard logging
+Check that events arrive (connect a client first):
 
-ProxyGuard tunnels WireGuard over TCP/443, so the kernel sees those packets as
-originating from `127.0.0.1`; the client's real public IP is visible **only** to
-Apache. Two pieces recover it (full snippet in
+```bash
+journalctl -t vpn-user-portal -n 5
+```
+
+### 2. Install the daemon
+
+```bash
+git clone https://github.com/giacomocamata/eduvpn-logger.git
+cd eduvpn-logger
+sudo ./install.sh
+```
+
+`install.sh` is idempotent and does the following:
+
+| Item | Path |
+|---|---|
+| packages | `wireguard-tools`, `python3` (required); `python3-maxminddb`, `geoipupdate` (optional, skipped if unavailable) |
+| programs | `/usr/local/sbin/eduvpn-logger.py`, `/usr/local/sbin/proxyguard-watcher.py` |
+| systemd units | `/etc/systemd/system/eduvpn-logger.service` (enabled and started), `proxyguard-watcher.service` (installed, not enabled) |
+| log directory | `/var/log/eduvpn`, `0750 root:adm` |
+| state | `/var/lib/eduvpn-logger` (journal cursor) |
+| log rotation | `/etc/logrotate.d/eduvpn-logger` |
+| syslog routing | `/etc/rsyslog.d/10-eduvpn.conf`, only if rsyslog is installed |
+
+<details>
+<summary>Manual installation (without <code>install.sh</code>)</summary>
+
+```bash
+sudo apt install -y wireguard-tools python3    # dnf on Fedora/EL
+sudo install -m 0755 eduvpn-logger.py proxyguard-watcher.py /usr/local/sbin/
+sudo install -m 0644 systemd/eduvpn-logger.service systemd/proxyguard-watcher.service /etc/systemd/system/
+sudo install -m 0644 examples/logrotate-eduvpn /etc/logrotate.d/eduvpn-logger
+sudo install -m 0644 examples/rsyslog-10-eduvpn.conf /etc/rsyslog.d/10-eduvpn.conf   # only with rsyslog
+sudo install -d -m 0750 -o root -g adm /var/log/eduvpn
+sudo systemctl daemon-reload
+sudo systemctl enable --now eduvpn-logger.service
+```
+
+</details>
+
+### 3. ProxyGuard source IPs (only if ProxyGuard is enabled)
+
+With [ProxyGuard](https://docs.eduvpn.org/server/v3/wireguard.html) clients
+reach WireGuard through Apache, so only Apache knows their address. Add to the
+eduVPN VirtualHost (full snippet:
 [`examples/apache-proxyguard.conf`](examples/apache-proxyguard.conf)):
 
-1. **START events** — raise the proxy log level for `/proxyguard/` only:
+```apache
+<LocationMatch "^/proxyguard/">
+    LogLevel warn proxy:trace1
+</LocationMatch>
+```
 
-   ```apache
-   <LocationMatch "^/proxyguard/">
-       LogLevel warn proxy:trace1
-   </LocationMatch>
-   ```
+Apache then writes one `AH10212 ... tunnel running` line with `[client IP:port]`
+to the VirtualHost `ErrorLog` when a tunnel opens; `proxyguard-watcher` turns it
+into `/var/log/apache2/proxyguard_start.log`, which the daemon reads. The
+`CustomLog` part of the snippet is optional and not used by the daemon.
 
-   Apache then emits a `tunnel running` trace line (carrying `[client IP:port]`)
-   into the VirtualHost **ErrorLog** at tunnel setup. `proxyguard-watcher.py`
-   tails that ErrorLog and rewrites it as compact `event=start` lines in
-   `proxyguard_start.log`, which the daemon reads.
+```bash
+sudo apache2ctl configtest && sudo systemctl reload apache2
+sudo systemctl enable --now proxyguard-watcher.service
+```
 
-2. **END events** — a `CustomLog` recording bytes and duration at tunnel close.
+The watcher reads `/var/log/apache2/error.log`. If the VirtualHost has its own
+`ErrorLog`, or on Fedora/EL (`/var/log/httpd/`), override the command:
 
-Apply the snippet and reload Apache. The watcher reads
-`/var/log/apache2/error.log` by default; if your VirtualHost has its own
-ErrorLog, override the command with `sudo systemctl edit proxyguard-watcher`:
+```bash
+sudo systemctl edit proxyguard-watcher.service
+```
 
 ```ini
 [Service]
 ExecStart=
-ExecStart=/bin/sh -c 'exec tail -n 0 -F /var/log/apache2/vpn.example.org_error.log | python3 -u /usr/local/sbin/proxyguard-watcher.py'
+ExecStart=/bin/sh -c 'exec tail -n 0 -F /var/log/httpd/vpn.example.org_ssl_error_log | python3 -u /usr/local/sbin/proxyguard-watcher.py'
+Environment=EDUVPN_PROXYGUARD_START_LOG=/var/log/httpd/proxyguard_start.log
 ```
+
+On Fedora/EL set the same `EDUVPN_PROXYGUARD_START_LOG` for `eduvpn-logger` too
+(see [Configuration](#configuration)).
+
+### 4. GeoIP (optional)
+
+Requires a free [MaxMind](https://www.maxmind.com/en/geolite2/signup) account.
+Put the account ID and license key in `/etc/GeoIP.conf` with
+`EditionIDs GeoLite2-City`, then:
 
 ```bash
-apache2ctl configtest && sudo systemctl reload apache2
-sudo systemctl enable --now proxyguard-watcher.service
+sudo geoipupdate -v      # on Debian the package is in "contrib"
+sudo systemctl restart eduvpn-logger.service
 ```
 
-### 3. GeoIP enrichment (optional)
+The database is found in `/usr/local/share/GeoIP`, `/usr/share/GeoIP` or
+`/var/lib/GeoIP`. Without it, `country` and `city` are simply omitted.
+
+### 5. Verify
+
+Connect a client with the eduVPN app and watch the output:
 
 ```bash
-sudo apt install -y python3-maxminddb geoipupdate   # Debian/Ubuntu
-# Put YOUR MaxMind account ID + license key in /etc/GeoIP.conf with
-#   EditionIDs GeoLite2-City
-sudo geoipupdate -v
+sudo tail -f /var/log/eduvpn/eduvpn.log
 ```
 
-Without a database the daemon runs unchanged and simply omits `country`/`city`.
-`install.sh` already installs the packages; only the license key is manual.
+A `connect` line with the user and the public source IP should appear within a
+few seconds of the tunnel coming up. Warnings from the daemon are in
+`journalctl -u eduvpn-logger.service`.
 
-### 4. Customising the configuration
+| Symptom | Likely cause |
+|---|---|
+| no lines at all | portal logging not enabled (step 1), or service not running: `systemctl status eduvpn-logger` |
+| `user=-` on connect lines | portal DB not found or not readable: check `EDUVPN_PORTAL_DB` |
+| `transport=tcp src_ip="-"` | ProxyGuard step missing, or watcher reading the wrong `ErrorLog`: `systemctl status proxyguard-watcher`, `tail /var/log/apache2/proxyguard_start.log` |
+| warning `ignoring unparsable/non-WireGuard event` | custom log template without `CONN=`, or an OpenVPN event (ignored by design) |
+| warning `untrusted _UID=…` | a portal event logged by a non-system account was rejected (see [Limitations](#limitations)) |
 
-The daemon is configured entirely through environment variables, all optional
-(see the [reference table](#configuration-reference)). Defaults match a stock
-Debian eduVPN install, so most deployments need no changes.
+## Configuration
 
-To override a value, create a systemd drop-in — **do not edit the installed unit**,
-`install.sh` replaces it on every run. The unit lists every variable as a
-commented `Environment=` line for reference:
+All settings are environment variables with defaults for a standard Debian
+eduVPN server. Change them with a systemd drop-in, which survives re-installs
+(the unit file itself lists every variable for reference):
 
 ```bash
 sudo systemctl edit eduvpn-logger.service
@@ -235,141 +212,119 @@ sudo systemctl edit eduvpn-logger.service
 
 ```ini
 [Service]
-# example: prefer Italian GeoIP names and a faster poll
 Environment=EDUVPN_GEOIP_LANG=it,en
-Environment=EDUVPN_WG_POLL_SEC=1.0
 ```
-
-`systemctl edit` reloads systemd on save; restart the daemon to apply:
 
 ```bash
 sudo systemctl restart eduvpn-logger.service
 ```
 
-(For a one-off test you can instead run the script directly with the variables
-inline, leaving the installed service untouched — note the separate state
-directory, so the test does not move the service's journal cursor:
-`sudo EDUVPN_LOG=/tmp/test.log EDUVPN_STATE_DIR=/tmp/eduvpn-test EDUVPN_SYSLOG_IDENT=eduvpn-logger-test eduvpn-logger.py`.)
-
-## Configuration reference
-
-All variables are optional. Defaults match a stock Debian eduVPN install.
-
 | Variable | Default | Meaning |
 |---|---|---|
-| `EDUVPN_LOG` | `/var/log/eduvpn/eduvpn.log` | Unified output log file |
-| `EDUVPN_PORTAL_DB` | `/var/lib/vpn-user-portal/db.sqlite` | Portal DB (read-only fallback) |
-| `EDUVPN_PROXYGUARD_START_LOG` | `/var/log/apache2/proxyguard_start.log` | ProxyGuard START events |
-| `EDUVPN_GEOIP_DB` | *(auto-detect)* | Explicit path to GeoLite2-City.mmdb |
-| `EDUVPN_GEOIP_LANG` | `en` | Preferred name language(s), comma-separated (e.g. `it,en`) |
+| `EDUVPN_LOG` | `/var/log/eduvpn/eduvpn.log` | output file |
+| `EDUVPN_PORTAL_DB` | `/var/lib/vpn-user-portal/db.sqlite` | portal database (read-only) |
+| `EDUVPN_PROXYGUARD_START_LOG` | `/var/log/apache2/proxyguard_start.log` | file written by `proxyguard-watcher` |
+| `EDUVPN_STATE_DIR` | `/var/lib/eduvpn-logger` | journal cursor |
+| `EDUVPN_GEOIP_DB` | *(searched)* | path of `GeoLite2-City.mmdb` |
+| `EDUVPN_GEOIP_LANG` | `en` | language(s) of place names, e.g. `it,en` |
 | `EDUVPN_SYSLOG_IDENT` | `eduvpn-logger` | syslog program name |
-| `EDUVPN_SYSLOG_FACILITY` | `local0` | syslog facility (`local0`..`local7`) |
-| `EDUVPN_WG_POLL_SEC` | `2.0` | `wg show` polling interval (seconds) |
-| `EDUVPN_DISCONNECT_AFTER_SEC` | `180.0` | handshake silence before a synthesised disconnect; **minimum 180** (WireGuard's key lifetime — lower values would cut live sessions and are raised, with a warning) |
-| `EDUVPN_CONNECT_GRACE_SEC` | `10.0` | max wait to attribute a connect to a user before emitting |
-| `EDUVPN_ROAM_MIN_INTERVAL_SEC` | `30.0` | minimum interval between roam events per peer (throttle) |
-| `EDUVPN_STATE_DIR` | `/var/lib/eduvpn-logger` | persistent state (journald cursor). **Give a test instance its own directory**, or it will move the production instance's cursor |
+| `EDUVPN_SYSLOG_FACILITY` | `local0` | syslog facility |
+| `EDUVPN_WG_POLL_SEC` | `2.0` | `wg show` polling interval, seconds |
+| `EDUVPN_CONNECT_GRACE_SEC` | `10.0` | max wait for user attribution before writing a connect |
+| `EDUVPN_DISCONNECT_AFTER_SEC` | `180.0` | handshake silence before an inferred disconnect; values below 180 are raised to 180 |
+| `EDUVPN_ROAM_MIN_INTERVAL_SEC` | `30.0` | minimum interval between roam lines per peer |
 
-Optionally route the daemon's syslog to a dedicated file with
-[`examples/rsyslog-10-eduvpn.conf`](examples/rsyslog-10-eduvpn.conf) (installed
-by `install.sh` when rsyslog is present; otherwise the events are in the
-journal under `-t eduvpn-logger`).
+The syslog copy goes to the journal (`journalctl -t eduvpn-logger`) and, with
+rsyslog, to `/var/log/eduvpn/eduvpn-syslog.log`; forward it to your SIEM from
+there. To try settings without touching the service, run a second instance with
+its own output and state directory:
 
-## Output fields
+```bash
+sudo EDUVPN_LOG=/tmp/test.log EDUVPN_STATE_DIR=/tmp/eduvpn-test EDUVPN_SYSLOG_IDENT=eduvpn-logger-test /usr/local/sbin/eduvpn-logger.py
+```
 
-Each line is `<ISO-8601 timestamp with µs and UTC offset> key=value ...`; values
-that may contain `:` or spaces are double-quoted. The timestamp is when the event
-happened (portal event time, or the WireGuard handshake time for a synthesised
-connect), not when the line was written. New keys may be appended in future
-versions; parsers should ignore unknown keys.
+## Log format
 
-| Field | Events | Notes |
+`<ISO-8601 timestamp, µs, UTC offset> key=value ...`. The timestamp is when the
+event happened, not when the line was written. Values that may contain `:` or
+spaces are double-quoted; `user` and `profile` are sanitised so they cannot
+inject extra keys. New keys may be added in future versions: ignore unknown ones.
+
+| Field | Events | Meaning |
 |---|---|---|
-| `event` | all | `connect` / `roam` / `disconnect` |
-| `user`, `profile` | all | from portal or DB fallback (`-` if unknown); sanitised |
-| `device` | when known | `android`/`ios`/`windows`/`macos`/`linux` |
-| `conn` | all | WireGuard public key (correlation key) |
-| `tunnel_ip4`, `tunnel_ip6` | connect/roam | assigned VPN IPs |
-| `src_ip`, `src_port` | all | public source endpoint (`-` if unknown) |
-| `src_ip_old`, `src_port_old` | roam | endpoint before the roam |
-| `transport` | all | `udp` (direct) / `tcp` (ProxyGuard) / `unknown` |
-| `tcp_candidates` | connect/roam, `tcp` | how many ProxyGuard starts the source was chosen among: `1` = unambiguous, `>1` = the closest in time was picked (see Limitations) |
-| `bytes_in`, `bytes_out` | disconnect | server's perspective: `in` = received from the client. From the portal when it reports the disconnect, otherwise the WireGuard counter delta since the connect was observed |
-| `inferred` | when `1` | line derived from WireGuard state, not reported by the portal (see above) |
-| `country`, `city` | when GeoIP available and IP is public | |
+| `event` | all | `connect`, `roam`, `disconnect` |
+| `user`, `profile` | all | from the portal or its DB; `-` if unknown |
+| `device` | when known | `android`, `ios`, `windows`, `macos`, `linux` (eduVPN app) |
+| `conn` | all | WireGuard public key |
+| `tunnel_ip4`, `tunnel_ip6` | connect, roam | addresses assigned inside the VPN |
+| `src_ip`, `src_port` | all | public source address; `-` if unknown |
+| `src_ip_old`, `src_port_old` | roam | source address before the roam |
+| `transport` | all | `udp`, `tcp` (ProxyGuard) or `unknown` |
+| `tcp_candidates` | connect, roam over `tcp` | tunnel starts the source IP was chosen among; `1` = unambiguous |
+| `bytes_in`, `bytes_out` | disconnect | seen from the server (`in` = sent by the client); from the portal, or WireGuard counters for inferred disconnects |
+| `inferred` | when `1` | derived from WireGuard state, not reported by the portal |
+| `country`, `city` | with GeoIP, public IPs | location of `src_ip` |
 
-## Limitations and threat model
+## Limitations
 
-The output is used as evidence ("who had this IP, from where, when"), so the
-assumptions behind each field matter:
-
-- **TCP (ProxyGuard) source IP is a time-based match.** Apache's start event and
-  WireGuard's handshake share no identifier, so the closest start in time is
-  attributed to the new peer, and each start is used at most once. Two clients
-  opening TCP tunnels within the same few seconds can be swapped, and since the
-  `/proxyguard/` endpoint is reachable without authentication, a third party can
-  add noise by opening tunnels. Every TCP line therefore says how many starts
-  were in the window (`tcp_candidates`): treat values above 1 as probable, not
-  certain. UDP source IPs come straight from the kernel and are exact. A
-  disconnect never borrows a start: if the source is unknown it says
-  `src_ip="-"`.
-- **Portal events are trusted by journald UID.** `SYSLOG_IDENTIFIER` can be set by
-  any local user (`logger -t vpn-user-portal …`), so only entries whose
-  journald-stamped `_UID` is a system account (≤ `SYS_UID_MAX` in
-  `/etc/login.defs`, normally 999 — root, `www-data`, `apache`) are accepted;
-  others are dropped with a warning naming the UID. A compromised *system*
-  account can still forge events.
-- **Poll granularity.** Endpoints and handshakes are sampled every
-  `EDUVPN_WG_POLL_SEC`; a roam and back within one interval is not seen, and
-  roams are throttled (`EDUVPN_ROAM_MIN_INTERVAL_SEC`; port-only changes are
-  suppressed).
-- **Restarts** — portal events are replayed from the journal, session state is
-  not; see *Restarts* above.
-- **Disconnect time of inferred disconnects** is the moment the silence threshold
-  was crossed, i.e. up to `EDUVPN_DISCONNECT_AFTER_SEC` after the last activity.
+- **ProxyGuard source IPs are matched by time.** Apache's tunnel start and the
+  WireGuard handshake share no identifier, so the closest start is used, once.
+  Clients opening TCP tunnels within the same few seconds can be swapped, and
+  `/proxyguard/` is reachable without authentication. Treat `tcp_candidates`
+  above 1 as probable, not certain. UDP source IPs come from the kernel and are
+  exact.
+- **Portal events are trusted by sender.** Any local user can write to the
+  journal with `logger -t vpn-user-portal`; only entries whose `_UID` (set by
+  journald) is a system account (≤ `SYS_UID_MAX`, normally 999: root,
+  `www-data`, `apache`) are accepted.
+- **Inferred disconnects** are written when the 180 s silence threshold is
+  crossed, i.e. up to 3 minutes after the last activity.
+- **After a restart** the daemon does not know which sessions it had already
+  logged: active peers get a new `connect` with `inferred=1` (for ProxyGuard
+  sessions with `src_ip="-"`; the line written before the restart has the IP).
+- Events are sampled every `EDUVPN_WG_POLL_SEC`: a roam and back within one
+  interval is not seen.
 
 ## Security and privacy
 
-The log holds personal data (user identifiers, public IP addresses, approximate
-location). Under the GDPR it needs a purpose, a legal basis and a retention
-period, defined by your institution with its DPO.
+The log contains personal data (user IDs, public IPs, location): define purpose,
+legal basis and retention with your Data Protection Officer.
 
-- **Access.** The unit runs with `UMask=0027` and `install.sh` creates
-  `/var/log/eduvpn` as `0750 root:adm`, so the logs are not world-readable.
-- **Retention.** [`examples/logrotate-eduvpn`](examples/logrotate-eduvpn) (installed
-  by `install.sh`) rotates `/var/log/eduvpn/*.log` daily and keeps 180 days; set
-  `rotate` to your policy. `proxyguard_start.log` (client IPs too) lives in
-  `/var/log/apache2` and follows the distribution's Apache policy (14 days on
-  Debian). Programs that follow `eduvpn.log` must reopen it by name after
-  rotation and read the new file from its start (`tail -F` does).
-- **Minimisation.** GeoIP is optional; leave it off if location is not needed.
-- **Integrity.** A local file can be altered by anyone with root on the VPN server.
-  For evidential use, forward the syslog stream to a remote collector/SIEM in
-  real time (e.g. rsyslog `omfwd` over TLS, or RELP).
-- **Hardening.** The daemon runs as root but its capability bounding set is cut
-  to `CAP_NET_ADMIN` (for `wg show`) and `CAP_DAC_READ_SEARCH`/`CAP_DAC_OVERRIDE`
-  (to read the `www-data`-owned portal DB, also in WAL mode), with systemd
-  sandboxing (`ProtectSystem`, `PrivateDevices`, `RestrictAddressFamilies`,
-  `SystemCallFilter`, `MemoryDenyWriteExecute`, …). `proxyguard-watcher` has no
-  capabilities and no network at all; check them with
-  `systemd-analyze security <unit>`.
+- **Access**: logs are created `0640 root:adm` in a `0750` directory.
+- **Retention**: `/etc/logrotate.d/eduvpn-logger` rotates daily and keeps 180
+  days; change `rotate` to your policy. `proxyguard_start.log` follows the
+  distribution's Apache rotation (14 days on Debian).
+- **Integrity**: anyone with root on the server can alter a local file; for
+  evidential use, forward the syslog stream to a remote collector in real time
+  (rsyslog `omfwd` over TLS, or RELP).
+- **Privileges**: both services run as root inside a systemd sandbox.
+  `eduvpn-logger` keeps only `CAP_NET_ADMIN` (`wg show`) and
+  `CAP_DAC_READ_SEARCH`/`CAP_DAC_OVERRIDE` (reading the portal DB);
+  `proxyguard-watcher` has no capabilities and no network. Inspect with
+  `systemd-analyze security eduvpn-logger.service`.
 
-## Manual install
+## Upgrade and removal
+
+Upgrade (drop-ins and logs are kept; services are restarted):
 
 ```bash
-sudo install -m 0755 eduvpn-logger.py /usr/local/sbin/eduvpn-logger.py
-sudo install -m 0755 proxyguard-watcher.py /usr/local/sbin/proxyguard-watcher.py
-sudo install -m 0644 systemd/eduvpn-logger.service /etc/systemd/system/
-sudo install -m 0644 systemd/proxyguard-watcher.service /etc/systemd/system/
-sudo install -m 0644 examples/rsyslog-10-eduvpn.conf /etc/rsyslog.d/10-eduvpn.conf   # if rsyslog is installed
-sudo install -m 0644 examples/logrotate-eduvpn /etc/logrotate.d/eduvpn-logger
-sudo install -d -m 0750 -o root -g adm /var/log/eduvpn
-sudo systemctl daemon-reload
-sudo systemctl enable --now eduvpn-logger.service
+cd eduvpn-logger && git pull && sudo ./install.sh
 ```
 
-Then complete the portal, Apache and GeoIP steps above and enable `proxyguard-watcher.service`.
+Removal (logs in `/var/log/eduvpn` are left in place):
+
+```bash
+sudo systemctl disable --now eduvpn-logger.service proxyguard-watcher.service
+sudo rm -f /usr/local/sbin/eduvpn-logger.py /usr/local/sbin/proxyguard-watcher.py \
+    /etc/systemd/system/eduvpn-logger.service /etc/systemd/system/proxyguard-watcher.service \
+    /etc/logrotate.d/eduvpn-logger /etc/rsyslog.d/10-eduvpn.conf
+sudo rm -rf /etc/systemd/system/eduvpn-logger.service.d \
+    /etc/systemd/system/proxyguard-watcher.service.d /var/lib/eduvpn-logger
+sudo systemctl daemon-reload
+```
+
+Then remove the `LocationMatch` block from the Apache VirtualHost if you added it.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).

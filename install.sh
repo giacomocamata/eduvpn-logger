@@ -12,7 +12,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo "==> Installing dependencies"
-# wireguard-tools is required; the GeoIP packages are optional and installed one
+# wireguard-tools and python3 are required; the GeoIP packages are optional and installed one
 # at a time (geoipupdate is in Debian *contrib*, python3-maxminddb may need EPEL):
 # one missing optional package must not abort the required one.
 if command -v apt-get >/dev/null 2>&1; then
@@ -24,12 +24,14 @@ else
     PKG=""
 fi
 if [ -n "$PKG" ]; then
-    $PKG wireguard-tools
+    $PKG wireguard-tools python3
     for p in python3-maxminddb geoipupdate; do
         $PKG "$p" || echo "WARN: optional package $p not installed (GeoIP only)" >&2
     done
 fi
-command -v wg >/dev/null 2>&1 || { echo "ERROR: 'wg' not found — install wireguard-tools" >&2; exit 1; }
+for c in wg python3; do
+    command -v "$c" >/dev/null 2>&1 || { echo "ERROR: '$c' not found — install wireguard-tools and python3" >&2; exit 1; }
+done
 
 echo "==> Installing scripts to $SBIN"
 install -m 0755 "$SRC/eduvpn-logger.py" "$SBIN/eduvpn-logger.py"
@@ -55,29 +57,31 @@ else
     echo "==> rsyslog not installed: events still reach the journal (journalctl -t eduvpn-logger)"
 fi
 
-echo "==> Enabling correlator service"
+echo "==> Enabling and (re)starting the services"
 systemctl daemon-reload
-systemctl enable --now eduvpn-logger.service
+systemctl enable eduvpn-logger.service
+# restart, not just start: on an upgrade the old code must not keep running
+systemctl restart eduvpn-logger.service
+# the watcher is enabled by hand (ProxyGuard only): restart it only if running
+systemctl try-restart proxyguard-watcher.service
 
 cat <<'EOF'
 
-==> Done. The correlator is running: journalctl -fu eduvpn-logger.service
+==> Done. eduvpn-logger is running: journalctl -u eduvpn-logger.service
 
-NEXT STEPS (cannot be safely automated):
+Remaining steps (see README, "Installation"):
 
-1. GeoIP (optional) — put your MaxMind account ID + license key in /etc/GeoIP.conf
-   with "EditionIDs GeoLite2-City", then:
-     sudo geoipupdate -v
+1. REQUIRED, if not done yet: portal connection logging, i.e. in
+   /etc/vpn-user-portal/config.php
+     'Log' => ['syslogConnectionEvents' => true, ...]
 
-2. Portal — /etc/vpn-user-portal/config.php must have
-   'Log' => ['syslogConnectionEvents' => true, ...] (see README "Portal logging").
-
-3. Apache / ProxyGuard — add examples/apache-proxyguard.conf to your VirtualHost
-   (edit the FQDN), then:
-     sudo apache2ctl configtest && sudo systemctl reload apache2
-   If your VirtualHost ErrorLog is not /var/log/apache2/error.log, override
-   ExecStart with `sudo systemctl edit proxyguard-watcher.service`, then:
+2. Only with ProxyGuard (WireGuard over TCP/443): add
+   examples/apache-proxyguard.conf to the VirtualHost, reload Apache, then
      sudo systemctl enable --now proxyguard-watcher.service
 
-WireGuard connect/roam/disconnect events are detected internally.
+3. Optional, GeoIP: MaxMind account ID + license key in /etc/GeoIP.conf
+   ("EditionIDs GeoLite2-City"), then: sudo geoipupdate -v
+
+Customise with `sudo systemctl edit eduvpn-logger.service` (drop-ins survive
+re-installs). Output: /var/log/eduvpn/eduvpn.log
 EOF
