@@ -105,10 +105,10 @@ sudo ./install.sh
 | packages | `wireguard-tools`, `python3` (required); `python3-maxminddb`, `geoipupdate` (optional, skipped if unavailable) |
 | programs | `/usr/local/sbin/eduvpn-logger.py`, `/usr/local/sbin/proxyguard-watcher.py` |
 | systemd units | `/etc/systemd/system/eduvpn-logger.service` (enabled and started), `proxyguard-watcher.service` (installed, not enabled) |
-| log directory | `/var/log/eduvpn`, `0750 root:adm` |
+| log directory | `/var/log/eduvpn`, `2750 root:adm` (setgid: new files get group `adm`) |
 | state | `/var/lib/eduvpn-logger` (journal cursor) |
 | log rotation | `/etc/logrotate.d/eduvpn-logger` |
-| syslog routing | `/etc/rsyslog.d/10-eduvpn.conf`, only if rsyslog is installed |
+| syslog routing | `/etc/rsyslog.d/10-eduvpn.conf`, only if rsyslog is installed and runs as root (Debian, Fedora/EL; not Ubuntu, where it runs as `syslog` and could not write to `/var/log/eduvpn`) |
 
 <details>
 <summary>Manual installation (without <code>install.sh</code>)</summary>
@@ -119,7 +119,7 @@ sudo install -m 0755 eduvpn-logger.py proxyguard-watcher.py /usr/local/sbin/
 sudo install -m 0644 systemd/eduvpn-logger.service systemd/proxyguard-watcher.service /etc/systemd/system/
 sudo install -m 0644 examples/logrotate-eduvpn /etc/logrotate.d/eduvpn-logger
 sudo install -m 0644 examples/rsyslog-10-eduvpn.conf /etc/rsyslog.d/10-eduvpn.conf   # only with rsyslog
-sudo install -d -m 0750 -o root -g adm /var/log/eduvpn
+sudo install -d -m 2750 -o root -g adm /var/log/eduvpn
 sudo systemctl daemon-reload
 sudo systemctl enable --now eduvpn-logger.service
 ```
@@ -290,7 +290,7 @@ inject extra keys. New keys may be added in future versions: ignore unknown ones
 The log contains personal data (user IDs, public IPs, location): define purpose,
 legal basis and retention with your Data Protection Officer.
 
-- **Access**: logs are created `0640 root:adm` in a `0750` directory.
+- **Access**: logs are created `0640 root:adm` in a `2750` directory.
 - **Retention**: `/etc/logrotate.d/eduvpn-logger` rotates daily and keeps 180
   days; change `rotate` to your policy. `proxyguard_start.log` follows the
   distribution's Apache rotation (14 days on Debian).
@@ -305,7 +305,8 @@ legal basis and retention with your Data Protection Officer.
 
 ## Upgrade and removal
 
-Upgrade (drop-ins and logs are kept; services are restarted):
+Upgrade (drop-ins and logs are kept; running services are restarted, a
+service you stopped or disabled is left alone):
 
 ```bash
 cd eduvpn-logger && git pull && sudo ./install.sh

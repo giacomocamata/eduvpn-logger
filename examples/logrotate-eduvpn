@@ -1,8 +1,9 @@
 # /etc/logrotate.d/eduvpn-logger
 # These logs hold personal data (user IDs, public IPs, geolocation): keep them
 # private and only as long as your retention policy requires (adjust `rotate`).
-# eduvpn-logger reopens the file on every line, so no postrotate signal is needed;
-# readers must follow the file by name (like `tail -F`).
+# eduvpn-logger reopens its file on every line; readers must follow it by name
+# (like `tail -F`). rsyslog keeps eduvpn-syslog.log open and must be told to
+# reopen it, or it keeps writing into the rotated (later deleted) file.
 # proxyguard_start.log is NOT listed: it lives in /var/log/apache2 and is already
 # rotated by the distribution's apache2 policy (a duplicate entry is an error).
 /var/log/eduvpn/*.log {
@@ -14,4 +15,8 @@
     delaycompress
     dateext
     create 0640 root adm
+    sharedscripts
+    postrotate
+        systemctl kill -s HUP rsyslog.service >/dev/null 2>&1 || true
+    endscript
 }

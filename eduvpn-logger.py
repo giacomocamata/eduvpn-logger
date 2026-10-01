@@ -52,7 +52,8 @@ GEOIP_DB = os.environ.get("EDUVPN_GEOIP_DB", "")
 GEOIP_LANG = os.environ.get("EDUVPN_GEOIP_LANG", "en")
 SYSLOG_IDENT = os.environ.get("EDUVPN_SYSLOG_IDENT", "eduvpn-logger")
 SYSLOG_FACILITY = os.environ.get("EDUVPN_SYSLOG_FACILITY", "local0")
-WG_POLL_SEC = float(os.environ.get("EDUVPN_WG_POLL_SEC", "2.0"))
+# Floor: 0 would spawn `wg` in a busy loop, a negative value would kill the poller.
+WG_POLL_SEC = max(0.5, float(os.environ.get("EDUVPN_WG_POLL_SEC", "2.0")))
 # Persistent state (the journald cursor). Give test instances their own directory.
 STATE_DIR = os.environ.get("EDUVPN_STATE_DIR", "/var/lib/eduvpn-logger")
 CURSOR_PATH = os.path.join(STATE_DIR, "journal.cursor")
@@ -112,7 +113,7 @@ def _san(value: str) -> str:
     # structured line or forge extra key=value pairs in the SIEM.
     if not value or value == "-":
         return value
-    return re.sub(r'[\s"=]+', "_", value)
+    return re.sub(r'[\s"=\x00-\x1f\x7f]+', "_", value)
 
 
 def _split_kv(message: str) -> Dict[str, str]:
@@ -289,19 +290,31 @@ class PortalDb:
         self._col_ip6: Optional[str] = None
         self._col_display_name: Optional[str] = None
         self._col_client_id: Optional[str] = None
+        self._retry_at = 0.0
+        self._warned = False
+        self._detect()
 
+    def _detect(self) -> None:
+        # Schema detection runs on a temporary connection. Lookups then use a fresh
+        # short-lived connection each time, so rows the portal commits after startup
+        # are always visible (a long-lived reader can miss them). Until it succeeds
+        # it is retried at most once a minute from lookup(): the DB may not exist
+        # yet at boot, or its schema may change with a portal upgrade.
+        self._retry_at = time.time() + 60.0
         try:
-            if not os.path.exists(db_path):
+            if not os.path.exists(self._db_path):
                 return
-            # Schema detection runs once on a temporary connection. Lookups then use
-            # a fresh short-lived connection each time, so rows the portal commits
-            # after startup are always visible (a long-lived reader can miss them).
-            self._conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+            self._conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, timeout=1.0)
             self._conn.row_factory = sqlite3.Row
             self._detect_schema()
         except Exception:
             self._query = None
         finally:
+            if self._query is None and not self._warned:
+                self._warned = True
+                _log_err("portal db", RuntimeError(
+                    f"no usable session table in {self._db_path}; connects without a portal "
+                    "event get user=- until it appears (retried every minute)"))
             if self._conn is not None:
                 try:
                     self._conn.close()
@@ -423,9 +436,11 @@ class PortalDb:
     def lookup(self, conn_id: str) -> Optional[DbConnInfo]:
         # Called from the correlator while self._lock is held, so keep it light:
         # a fresh mode=ro connection with a 1s timeout (no write lock, WAL-safe).
-        if self._query is None:
-            return None
         if not conn_id or conn_id == "-":
+            return None
+        if self._query is None and time.time() >= self._retry_at:
+            self._detect()
+        if self._query is None:
             return None
         try:
             conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, timeout=1.0)
@@ -434,6 +449,12 @@ class PortalDb:
                 row = conn.execute(self._query, (conn_id,)).fetchone()
             finally:
                 conn.close()
+        except sqlite3.OperationalError as e:
+            if str(e).startswith("no such"):
+                # Table/column gone (portal upgrade): detect the schema again.
+                # Not on "database is locked": that is transient.
+                self._query = None
+            return None
         except Exception:
             return None
         if row is None:
@@ -895,6 +916,11 @@ class Correlator:
         for pubkey, ts in list(self._emitted_disconnect_ts.items()):
             if ts < cutoff_emitted:
                 self._emitted_disconnect_ts.pop(pubkey, None)
+        for pubkey, info in list(self._conn_info.items()):
+            # A portal CONNECT whose peer never showed up in wg and that never got
+            # a DISCONNECT would otherwise be kept for the daemon's whole lifetime.
+            if info.ts < cutoff_emitted and pubkey not in self._virtual_peers and pubkey not in self._pending_connect:
+                self._conn_info.pop(pubkey, None)
 
     def _match_tcp_start(self, now_ts: float, pubkey: str) -> Optional[TcpStartEvent]:
         # Closest start in time. A start may be stamped slightly *after* the WG
@@ -1063,7 +1089,10 @@ class Correlator:
             pubkey = pubkey.strip()
             endpoint = endpoint.strip()
             if pubkey:
-                if (ts - self._emitted_disconnect_ts.get(pubkey, 0.0)) < 300.0:
+                # Already disconnected by the portal moments ago: don't log it twice.
+                # Unless a new session (same key) was announced since then — that one
+                # must get its own disconnect.
+                if (ts - self._emitted_disconnect_ts.get(pubkey, 0.0)) < 300.0 and pubkey not in self._emitted_connect_ts:
                     self._pubkey_src.pop(pubkey, None)
                     self._pending_connect.pop(pubkey, None)
                     self._conn_info.pop(pubkey, None)

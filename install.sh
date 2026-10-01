@@ -37,37 +37,60 @@ echo "==> Installing scripts to $SBIN"
 install -m 0755 "$SRC/eduvpn-logger.py" "$SBIN/eduvpn-logger.py"
 install -m 0755 "$SRC/proxyguard-watcher.py" "$SBIN/proxyguard-watcher.py"
 
+# An existing unit means this is an upgrade (see the end of the script).
+UPGRADE=0
+[ -f "$UNITS/eduvpn-logger.service" ] && UPGRADE=1
+
 echo "==> Installing systemd units to $UNITS"
 # Units are overwritten on re-run: customise them with `systemctl edit <unit>`
 # (drop-ins survive), not by editing these files.
 install -m 0644 "$SRC/systemd/eduvpn-logger.service" "$UNITS/eduvpn-logger.service"
 install -m 0644 "$SRC/systemd/proxyguard-watcher.service" "$UNITS/proxyguard-watcher.service"
 
-echo "==> Creating /var/log/eduvpn (0750: the logs hold personal data)"
-install -d -m 0750 -o root -g adm /var/log/eduvpn
+echo "==> Creating /var/log/eduvpn (2750 root:adm: the logs hold personal data)"
+# setgid: files created in it (by the daemon, rsyslog) belong to group adm too.
+install -d -m 2750 -o root -g adm /var/log/eduvpn
 
 echo "==> Installing logrotate policy"
 install -m 0644 "$SRC/examples/logrotate-eduvpn" /etc/logrotate.d/eduvpn-logger
 
-if [ -d /etc/rsyslog.d ]; then
+if [ -d /etc/rsyslog.d ] && grep -qs '^[$]PrivDropToUser' /etc/rsyslog.conf; then
+    # Ubuntu: rsyslog runs as user syslog and cannot write into the root:adm
+    # 2750 log directory; the snippet would only make the events vanish from
+    # /var/log/syslog (its "& stop"). They stay in the journal and eduvpn.log.
+    echo "WARN: rsyslog drops privileges here: snippet not installed (events: journalctl -t eduvpn-logger)" >&2
+    if [ -f /etc/rsyslog.d/10-eduvpn.conf ]; then
+        rm -f /etc/rsyslog.d/10-eduvpn.conf
+        systemctl restart rsyslog 2>/dev/null || echo "WARN: could not restart rsyslog" >&2
+    fi
+elif [ -d /etc/rsyslog.d ]; then
     echo "==> Installing rsyslog snippet"
-    install -m 0644 "$SRC/examples/rsyslog-10-eduvpn.conf" /etc/rsyslog.d/10-eduvpn.conf
-    systemctl restart rsyslog 2>/dev/null || echo "WARN: could not restart rsyslog" >&2
+    # Restart the system logger only when the snippet actually changed.
+    if ! cmp -s "$SRC/examples/rsyslog-10-eduvpn.conf" /etc/rsyslog.d/10-eduvpn.conf; then
+        install -m 0644 "$SRC/examples/rsyslog-10-eduvpn.conf" /etc/rsyslog.d/10-eduvpn.conf
+        systemctl restart rsyslog 2>/dev/null || echo "WARN: could not restart rsyslog" >&2
+    fi
 else
     echo "==> rsyslog not installed: events still reach the journal (journalctl -t eduvpn-logger)"
 fi
 
-echo "==> Enabling and (re)starting the services"
 systemctl daemon-reload
-systemctl enable eduvpn-logger.service
-# restart, not just start: on an upgrade the old code must not keep running
-systemctl restart eduvpn-logger.service
-# the watcher is enabled by hand (ProxyGuard only): restart it only if running
-systemctl try-restart proxyguard-watcher.service
+if [ "$UPGRADE" -eq 1 ]; then
+    # Upgrade: restart what is running (the old code must not keep running), but
+    # never re-enable a service the administrator stopped or disabled.
+    echo "==> Restarting the running services"
+    systemctl try-restart eduvpn-logger.service proxyguard-watcher.service
+else
+    echo "==> Enabling and starting eduvpn-logger"
+    systemctl enable --now eduvpn-logger.service
+fi
+if ! systemctl is-active --quiet eduvpn-logger.service; then
+    echo "WARN: eduvpn-logger is not running: sudo systemctl enable --now eduvpn-logger.service" >&2
+fi
 
 cat <<'EOF'
 
-==> Done. eduvpn-logger is running: journalctl -u eduvpn-logger.service
+==> Done. Status and warnings: journalctl -u eduvpn-logger.service
 
 Remaining steps (see README, "Installation"):
 
