@@ -631,15 +631,12 @@ class Correlator:
         src_port: str,
         transport: str,
     ) -> None:
-        bytes_in, bytes_out = self._wg_peer_bytes_int(ev.conn)
-        if bytes_in is not None and bytes_out is not None:
-            self._wg_bytes_baseline[ev.conn] = (bytes_in, bytes_out)
+        # Counters from the poller's snapshot (no subprocess under the lock).
+        last = self._wg_bytes_last.get(ev.conn)
+        if last is not None:
+            self._wg_bytes_baseline[ev.conn] = last
         else:
-            last = self._wg_bytes_last.get(ev.conn)
-            if last is not None:
-                self._wg_bytes_baseline[ev.conn] = last
-            else:
-                self._wg_bytes_baseline_pending.add(ev.conn)
+            self._wg_bytes_baseline_pending.add(ev.conn)
         country, city = self._geo.lookup(src_ip)
         msg = f"event=connect user={_san(ev.user)} profile={_san(ev.profile)}"
         if ev.device and ev.device != "-":
@@ -725,17 +722,6 @@ class Correlator:
         # >1 = the closest one was picked (see README "Limitations").
         n = self._tcp_candidates.get(pubkey)
         return f" tcp_candidates={n}" if transport == "tcp" and n else ""
-
-    def _wg_peer_bytes_int(self, pubkey: str) -> Tuple[Optional[int], Optional[int]]:
-        # Read rx/tx from the poller's snapshot (refreshed every WG_POLL_SEC). No
-        # subprocess: this is called while the lock is held, where a blocking
-        # `wg show` could stall live event processing.
-        if not pubkey or pubkey == "-":
-            return None, None
-        last = self._wg_bytes_last.get(pubkey)
-        if last is None:
-            return None, None
-        return last[0], last[1]
 
     @staticmethod
     def _wg_dump() -> Tuple[Dict[str, Tuple[int, int]], Optional[Dict[str, int]], Dict[str, str], bool]:
@@ -895,16 +881,21 @@ class Correlator:
                 # For TCP/ProxyGuard the raw IP is always loopback, so the real client
                 # IP is hidden: treat any endpoint change as a roam candidate.
                 real_roam = _is_loopback(new_ip) or (prev_ip != new_ip)
-                if real_roam and (now - self._roam_last.get(pubkey, 0.0)) >= ROAM_MIN_INTERVAL_SEC:
+                # A connect still held (TCP, waiting for its start) is written later
+                # with the current source: no roam line before it.
+                held = pubkey in self._pending_connect and pubkey not in self._emitted_connect_ts
+                if real_roam and not held and (now - self._roam_last.get(pubkey, 0.0)) >= ROAM_MIN_INTERVAL_SEC:
                     self._roam_last[pubkey] = now
                     self._handle_wg_event_locked(now, f"{pubkey} roamed to {endpoint}")
                 elif _is_loopback(new_ip):
                     # No roam line, but a new ProxyGuard tunnel still claims its start
                     # (or it could be matched to another client) and the disconnect
-                    # line must carry the current source.
+                    # line must carry the current source (unknown without a start).
                     tcp = self._match_tcp_start(now, pubkey)
                     if tcp is not None:
                         self._pubkey_src[pubkey] = (now, tcp.src_ip, tcp.src_port, "tcp")
+                    else:
+                        self._pubkey_src[pubkey] = (now, "-", "-", "tcp")
                 elif new_ip:
                     self._pubkey_src[pubkey] = (now, new_ip, new_port or "-", "udp")
 
@@ -924,12 +915,10 @@ class Correlator:
             self._handle_wg_event_locked(now, f"{pubkey} disconnected from {endpoint}")
 
     def _wg_peer_bytes_delta(self, pubkey: str) -> Tuple[str, str]:
-        now_rx, now_tx = self._wg_peer_bytes_int(pubkey)
-        if now_rx is None or now_tx is None:
-            last = self._wg_bytes_last.get(pubkey)
-            if last is None:
-                return "-", "-"
-            now_rx, now_tx = last
+        last = self._wg_bytes_last.get(pubkey)
+        if last is None:
+            return "-", "-"
+        now_rx, now_tx = last
         base = self._wg_bytes_baseline.get(pubkey)
         if base is None:
             return str(now_rx), str(now_tx)
@@ -1121,12 +1110,11 @@ class Correlator:
                     ip = tcp.src_ip
                     port = tcp.src_port
                 else:
-                    if src_ip_old != "-" and not _is_loopback(src_ip_old):
-                        ip = src_ip_old
-                        port = src_port_old
-                    else:
-                        ip = "-"
-                        port = "-"
+                    # A new tunnel without its start: source unknown. The previous one
+                    # (another tunnel, or the UDP path before a fallback) is not it.
+                    ip = "-"
+                    port = "-"
+                    self._tcp_candidates.pop(pubkey, None)
             else:
                 transport = "udp"
 
@@ -1341,6 +1329,12 @@ class Correlator:
             self._virtual_peers.pop(conn, None)
             self._tcp_candidates.pop(conn, None)
             self._virtual_due.pop(conn, None)
+            # The portal removed the peer before logging: its last endpoint/counters
+            # belong to the ended session. A CONNECT reusing the key (allowed by the
+            # API) must not inherit them, nor time-match another client's TCP start.
+            # If the peer is still in wg, the next poll reloads them.
+            self._wg_endpoint_last.pop(conn, None)
+            self._wg_bytes_last.pop(conn, None)
             self._prune_locked(ts)
             return
 
