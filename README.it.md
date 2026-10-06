@@ -20,7 +20,7 @@ tempo reale e scrive **una riga `chiave=valore` per evento di sessione**
 
 È un daemon Python in un solo file (solo standard library), in produzione
 all'Università di Trieste. Gestisce solo sessioni **WireGuard**: per OpenVPN il
-portale registra già da sé l'IP di provenienza.
+portale può registrare da sé l'IP di provenienza (`originatingIp`).
 
 ## Come funziona
 
@@ -43,7 +43,9 @@ stato dei peer letto periodicamente:
   handshake, quindi con la sua provenienza; senza handshake entro 2 minuti viene
   scritta senza.
 - **roam**: cambia l'IP di provenienza di un peer attivo. I cambi della sola porta
-  (rebinding NAT) sono ignorati; i roam sono limitati a uno per peer ogni 30 s.
+  (rebinding NAT) sono ignorati. Al massimo una riga roam per peer ogni 30 s: uno
+  spostamento dentro quell'intervallo viene scritto quando finisce, con l'ora in
+  cui è avvenuto, a meno che il peer non sia tornato all'indirizzo precedente.
 - **disconnect**: preso dal DISCONNECT del portale quando l'app eduVPN si
   disconnette; altrimenti (client WireGuard generico, o tunnel inattivo) emesso
   dopo 180 s senza handshake, la durata delle chiavi di WireGuard.
@@ -63,6 +65,9 @@ avvio, con il loro timestamp originale.
 - Server eduVPN v3 (`vpn-user-portal`) con WireGuard, su Linux con systemd.
   Testato su Debian/Ubuntu; Fedora/EL richiedono gli adattamenti di percorso
   indicati sotto.
+- Portale e WireGuard sulla stessa macchina: il daemon legge journal e database
+  del portale ed esegue `wg show` in locale. Le installazioni multi-nodo, con il
+  portale su un controller separato, non sono supportate.
 - `wireguard-tools` (`wg`) e Python ≥ 3.9, solo standard library (entrambi
   installati da `install.sh`).
 - *Opzionale:* `python3-maxminddb` e un database MaxMind GeoLite2-City per
@@ -86,7 +91,8 @@ In `/etc/vpn-user-portal/config.php`, nella sezione `Log`:
 L'impostazione viene letta alla richiesta successiva al portale; non serve
 `vpn-maint-apply-changes`. Senza i due template il portale usa il suo formato di
 default, anch'esso riconosciuto, ma i disconnect non hanno i contatori di byte. I
-template personalizzati devono mantenere le chiavi `USER=`, `PROFILE=` e `CONN=`.
+template personalizzati devono iniziare con `CONNECT` / `DISCONNECT` e mantenere
+le chiavi `USER=`, `PROFILE=` e `CONN=`.
 Riferimento: [eduVPN logging](https://docs.eduvpn.org/server/v3/logging.html).
 
 Verifica che gli eventi arrivino (dopo aver connesso un client):
@@ -200,7 +206,7 @@ l'utente e l'IP pubblico di provenienza. Gli avvisi del daemon sono in
 | Sintomo | Causa probabile |
 |---|---|
 | nessuna riga | logging del portale non abilitato (passo 1), o servizio non attivo: `systemctl status eduvpn-logger` |
-| `user=-` nelle righe connect | database del portale non trovato o non leggibile: controlla `EDUVPN_PORTAL_DB` |
+| `user=-` nelle righe connect | database del portale non trovato o non leggibile: controlla `EDUVPN_PORTAL_DB`; oppure peer di un'interfaccia WireGuard non eduVPN: imposta `EDUVPN_WG_INTERFACES` |
 | `transport=tcp src_ip="-"` | passo ProxyGuard mancante, o watcher che legge l'`ErrorLog` sbagliato: `systemctl status proxyguard-watcher`, `tail /var/log/apache2/proxyguard_start.log` |
 | avviso `ignoring unparsable/non-WireGuard event` | template personalizzato senza `CONN=`, o evento OpenVPN (ignorato di proposito) |
 | avviso `untrusted _UID=…` | scartato un evento del portale registrato da un account non di sistema (vedi [Limiti](#limiti)) |
@@ -254,7 +260,12 @@ sudo EDUVPN_LOG=/tmp/test.log EDUVPN_STATE_DIR=/tmp/eduvpn-test EDUVPN_SYSLOG_ID
 ## Formato del log
 
 `<timestamp ISO-8601, µs, offset UTC> chiave=valore ...`. Il timestamp è il
-momento in cui l'evento è avvenuto, non quello in cui la riga è stata scritta. I
+momento in cui l'evento è avvenuto, non quello in cui la riga è stata scritta,
+quindi le righe non sono rigorosamente in ordine di timestamp: una connect
+trattenuta in attesa della provenienza, o un roam rimandato dal limite dei 30 s,
+può essere scritto fino a due minuti dopo.
+Le righe di una stessa sessione sono sempre scritte in ordine (connect, roam,
+disconnect). I
 valori che possono contenere `:` o spazi sono tra virgolette; `user` e `profile`
 sono sanificati, così non possono iniettare chiavi aggiuntive. Versioni future
 possono aggiungere chiavi: ignora quelle sconosciute.
@@ -263,7 +274,7 @@ possono aggiungere chiavi: ignora quelle sconosciute.
 |---|---|---|
 | `event` | tutti | `connect`, `roam`, `disconnect` |
 | `user`, `profile` | tutti | dal portale o dal suo database; `-` se ignoti |
-| `device` | quando noto | `android`, `ios`, `windows`, `macos`, `linux` (app eduVPN) |
+| `device` | quando noto | `android`, `ios`, `windows`, `macos`, `linux` (app eduVPN, Let's Connect! o govVPN) |
 | `conn` | tutti | public key WireGuard |
 | `tunnel_ip4`, `tunnel_ip6` | connect, roam | indirizzi assegnati dentro la VPN |
 | `src_ip`, `src_port` | tutti | indirizzo pubblico di provenienza; `-` se ignoto |
@@ -287,8 +298,8 @@ possono aggiungere chiavi: ignora quelle sconosciute.
   locale può scrivere nel journal con `logger -t vpn-user-portal`; sono accettate
   solo le voci il cui `_UID` (impostato da journald) è un account di sistema
   (≤ `SYS_UID_MAX`, normalmente 999: root, `www-data`, `apache`).
-- **I disconnect dedotti** vengono scritti quando si supera la soglia di 180 s di
-  silenzio, cioè fino a 3 minuti dopo l'ultima attività.
+- **I disconnect dedotti** vengono scritti, e datati, quando si supera la soglia
+  di 180 s di silenzio, cioè fino a 3 minuti dopo l'ultima attività.
 - **Dopo un riavvio** il daemon non sa quali sessioni aveva già registrato: i peer
   attivi ricevono una nuova `connect` con `inferred=1` (per le sessioni ProxyGuard
   con `src_ip="-"`; la riga scritta prima del riavvio contiene l'IP).

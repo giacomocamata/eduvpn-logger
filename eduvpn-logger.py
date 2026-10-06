@@ -198,7 +198,8 @@ def _device_from_client_marker(*markers: str) -> str:
         if not m or m == "-":
             continue
         s = str(m).strip().lower()
-        m2 = re.search(r"\borg\.eduvpn\.app\.(android|ios|windows|macos|linux)\b", s)
+        # OAuth client IDs of the eduVPN, Let's Connect! and govVPN apps.
+        m2 = re.search(r"\borg\.(?:eduvpn|letsconnect-vpn|govvpn)\.app\.(android|ios|windows|macos|linux)\b", s)
         if m2 is not None:
             return str(m2.group(1))
     return "-"
@@ -550,11 +551,15 @@ class Correlator:
         self._virtual_due: Dict[str, Tuple[float, float]] = {}
         # pubkey -> ts of the last roam line emitted (throttles roam noise).
         self._roam_last: Dict[str, float] = {}
+        # pubkey -> source the last line had, for a roam held back by the throttle.
+        self._roam_owed: Dict[str, Tuple[float, str, str, str]] = {}
         # pubkey -> number of ProxyGuard starts its TCP source was chosen among.
         self._tcp_candidates: Dict[str, int] = {}
         # pubkey -> last time a peer whose session ended by handshake silence was
         # still seen in wg: a portal DISCONNECT arriving later only echoes that end.
         self._silence_closed: Dict[str, float] = {}
+        # Keys closed by a portal DISCONNECT since the current `wg show` started.
+        self._closed_while_polling: set[str] = set()
         self._warned_portal_format = False
         self._wg_warned = False
         self._recent_lines: deque[str] = deque()
@@ -717,6 +722,29 @@ class Correlator:
         line = f"{_iso_from_ts(ts)} {msg}"
         self._write_line(line)
 
+    def _write_roam(self, ts: float, pubkey: str, src_ip_old: str, src_port_old: str) -> None:
+        # Roam line to the source already recorded in _pubkey_src.
+        _ts, src_ip, src_port, transport = self._pubkey_src[pubkey]
+        info = self._conn_info.get(pubkey)
+        if info is None:
+            db = self._db.lookup(pubkey)
+            if db is not None:
+                info = ConnectEvent(ts=ts, user=db.user, profile=db.profile, device=_device_from_client_marker(db.client_id, db.display_name), conn=pubkey, ip4=db.ip4, ip6=db.ip6)
+                self._conn_info[pubkey] = info
+        self._emit_roam(
+            ts=ts,
+            user=info.user if info else "-",
+            profile=info.profile if info else "-",
+            conn=pubkey,
+            ip4=info.ip4 if info else "-",
+            ip6=info.ip6 if info else "-",
+            src_ip_old=src_ip_old,
+            src_port_old=src_port_old,
+            src_ip=src_ip,
+            src_port=src_port,
+            transport=transport,
+        )
+
     def _tcp_candidates_kv(self, pubkey: str, transport: str) -> str:
         # How many ProxyGuard starts the time match chose from: 1 = unambiguous,
         # >1 = the closest one was picked (see README "Limitations").
@@ -776,6 +804,8 @@ class Correlator:
     def update_wg_counters(self) -> None:
         # Called periodically by a background thread. The wg subprocess runs here
         # WITHOUT the lock; only the in-memory update + reconciliation are locked.
+        with self._lock:
+            self._closed_while_polling = set()
         snap, handshake, endpoint, ok = self._wg_dump()
         if handshake is None:
             # Once per outage, not every poll: without `wg show ... dump` (wg missing,
@@ -792,6 +822,19 @@ class Correlator:
             self._prune(time.time())
             return
         with self._lock:
+            # Sessions the portal closed while `wg show` ran: this snapshot predates
+            # the DISCONNECT and would revive them (the key may be reused at once).
+            for k in self._closed_while_polling:
+                snap.pop(k, None)
+                endpoint.pop(k, None)
+                if handshake is not None:
+                    handshake.pop(k, None)
+            for k, (rx, tx) in snap.items():
+                last, base = self._wg_bytes_last.get(k), self._wg_bytes_baseline.get(k)
+                if last and base and (rx < last[0] or tx < last[1]):
+                    # Peer re-created (wg0 restart): its counters start again from 0.
+                    # Shift the baseline so the bytes before still reach the disconnect.
+                    self._wg_bytes_baseline[k] = (base[0] - last[0], base[1] - last[1])
             self._wg_bytes_last.update(snap)
             self._wg_endpoint_last.update(endpoint)
             if self._wg_bytes_baseline_pending:
@@ -819,6 +862,7 @@ class Correlator:
                 self._peer_last_handshake,
                 self._wg_bytes_baseline,
                 self._roam_last,
+                self._roam_owed,
                 self._tcp_candidates,
             ):
                 for k in [k for k in d if k not in keep]:
@@ -842,7 +886,11 @@ class Correlator:
         # endpoint and a last-handshake per peer, so polling `wg show` carries the
         # association at the poll resolution without any external daemon.
         for pubkey, last_hs in hs.items():
-            self._peer_last_handshake[pubkey] = last_hs
+            if last_hs:
+                # 0 = no handshake yet: a peer re-created under a live session
+                # (wg-quick restart, e.g. apply-changes) keeps its last known one,
+                # or it would look silent forever and be disconnected at once.
+                self._peer_last_handshake[pubkey] = last_hs
             endpoint = ep.get(pubkey, "")
             active = bool(last_hs) and (now - float(last_hs)) <= ACTIVE_HANDSHAKE_MAX_AGE_SEC
             if not active or not endpoint or endpoint == "(none)":
@@ -884,20 +932,41 @@ class Correlator:
                 # A connect still held (TCP, waiting for its start) is written later
                 # with the current source: no roam line before it.
                 held = pubkey in self._pending_connect and pubkey not in self._emitted_connect_ts
-                if real_roam and not held and (now - self._roam_last.get(pubkey, 0.0)) >= ROAM_MIN_INTERVAL_SEC:
+                throttled = (now - self._roam_last.get(pubkey, 0.0)) < ROAM_MIN_INTERVAL_SEC
+                if real_roam and not held and throttled:
+                    # Written when the interval is over (loop below), from the source
+                    # the last line had.
+                    self._roam_owed.setdefault(pubkey, self._pubkey_src.get(pubkey, (now, "-", "-", "unknown")))
+                if real_roam and not held and not throttled:
                     self._roam_last[pubkey] = now
+                    self._roam_owed.pop(pubkey, None)  # this line has the latest move
                     self._handle_wg_event_locked(now, f"{pubkey} roamed to {endpoint}")
                 elif _is_loopback(new_ip):
-                    # No roam line, but a new ProxyGuard tunnel still claims its start
-                    # (or it could be matched to another client) and the disconnect
+                    # No roam line now, but a new ProxyGuard tunnel still claims its
+                    # start (or it could be matched to another client) and the next
                     # line must carry the current source (unknown without a start).
                     tcp = self._match_tcp_start(now, pubkey)
                     if tcp is not None:
                         self._pubkey_src[pubkey] = (now, tcp.src_ip, tcp.src_port, "tcp")
                     else:
                         self._pubkey_src[pubkey] = (now, "-", "-", "tcp")
+                        self._tcp_candidates.pop(pubkey, None)
                 elif new_ip:
                     self._pubkey_src[pubkey] = (now, new_ip, new_port or "-", "udp")
+
+        # Throttled roams: once the interval is over, one line from the source last
+        # written to the current one, stamped when the move was seen.
+        for pubkey, old in list(self._roam_owed.items()):
+            if now - self._roam_last.get(pubkey, 0.0) < ROAM_MIN_INTERVAL_SEC:
+                continue
+            del self._roam_owed[pubkey]
+            cur = self._pubkey_src.get(pubkey)
+            if cur is None or pubkey not in self._virtual_peers:
+                continue
+            if (cur[1], cur[3]) == (old[1], old[3]) and (cur[3] != "tcp" or cur[2] == old[2]):
+                continue  # back where it was (UDP: same IP; TCP: same tunnel)
+            self._roam_last[pubkey] = now
+            self._write_roam(cur[0], pubkey, old[1], old[2])
 
         # A peer whose handshake has gone silent past the threshold is treated as
         # disconnected. For app sessions the portal DISCONNECT normally fires first
@@ -923,8 +992,8 @@ class Correlator:
         if base is None:
             return str(now_rx), str(now_tx)
         base_rx, base_tx = base
-        # A counter below its baseline means the peer was re-created (e.g. a
-        # vpn-daemon restart) and counts from 0 again: report what came after.
+        # The poller shifts the baseline when a peer is re-created; a counter still
+        # below it would be a reset it missed: never report a negative delta.
         d_rx = now_rx - base_rx if now_rx >= base_rx else now_rx
         d_tx = now_tx - base_tx if now_tx >= base_tx else now_tx
         return str(d_rx), str(d_tx)
@@ -1119,41 +1188,7 @@ class Correlator:
                 transport = "udp"
 
             self._pubkey_src[pubkey] = (ts, ip or "-", port or "-", transport)
-
-            info = self._conn_info.get(pubkey)
-            if info is None:
-                db = self._db.lookup(pubkey)
-                if db is None:
-                    ip4 = "-"
-                    ip6 = "-"
-                    user = "-"
-                    profile = "-"
-                else:
-                    info = ConnectEvent(ts=ts, user=db.user, profile=db.profile, device=_device_from_client_marker(db.client_id, db.display_name), conn=pubkey, ip4=db.ip4, ip6=db.ip6)
-                    self._conn_info[pubkey] = info
-                    ip4 = info.ip4
-                    ip6 = info.ip6
-                    user = info.user
-                    profile = info.profile
-            else:
-                ip4 = info.ip4
-                ip6 = info.ip6
-                user = info.user
-                profile = info.profile
-
-            self._emit_roam(
-                ts=ts,
-                user=user,
-                profile=profile,
-                conn=pubkey,
-                ip4=ip4,
-                ip6=ip6,
-                src_ip_old=src_ip_old,
-                src_port_old=src_port_old,
-                src_ip=ip or "-",
-                src_port=port or "-",
-                transport=transport,
-            )
+            self._write_roam(ts, pubkey, src_ip_old, src_port_old)
             self._prune_locked(ts)
             return
 
@@ -1175,6 +1210,7 @@ class Correlator:
                     self._wg_bytes_baseline_pending.discard(pubkey)
                     self._virtual_peers.pop(pubkey, None)
                     self._tcp_candidates.pop(pubkey, None)
+                    self._roam_owed.pop(pubkey, None)
                     self._virtual_due.pop(pubkey, None)
                     self._prune_locked(ts)
                     return
@@ -1219,6 +1255,7 @@ class Correlator:
                 self._wg_bytes_baseline.pop(pubkey, None)
                 self._virtual_peers.pop(pubkey, None)
                 self._tcp_candidates.pop(pubkey, None)
+                self._roam_owed.pop(pubkey, None)
                 self._virtual_due.pop(pubkey, None)
             self._prune_locked(ts)
             return
@@ -1328,6 +1365,7 @@ class Correlator:
             self._wg_bytes_baseline_pending.discard(conn)
             self._virtual_peers.pop(conn, None)
             self._tcp_candidates.pop(conn, None)
+            self._roam_owed.pop(conn, None)
             self._virtual_due.pop(conn, None)
             # The portal removed the peer before logging: its last endpoint/counters
             # belong to the ended session. A CONNECT reusing the key (allowed by the
@@ -1335,6 +1373,7 @@ class Correlator:
             # If the peer is still in wg, the next poll reloads them.
             self._wg_endpoint_last.pop(conn, None)
             self._wg_bytes_last.pop(conn, None)
+            self._closed_while_polling.add(conn)
             self._prune_locked(ts)
             return
 
