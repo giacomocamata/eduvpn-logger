@@ -1103,8 +1103,9 @@ class Correlator:
             if pubkey and ip is None:
                 self._prune_locked(ts)
                 return
+            before = self._pubkey_src.get(pubkey)
             if _is_loopback(ip):
-                cur = self._pubkey_src.get(pubkey)
+                cur = before
                 tcp = None
                 if cur is not None and cur[3] == "tcp" and cur[1] != "-":
                     pass  # already attributed (portal path): another start would be someone else's
@@ -1154,6 +1155,11 @@ class Correlator:
                     _ts2, src_ip, src_port, transport = self._pubkey_src.get(pubkey, (ts, "-", "-", "unknown"))
                     self._emit_connect(info, src_ip, src_port, transport)
                     self._emitted_connect_ts[pubkey] = ts
+                elif before is None and self._pubkey_src[pubkey][1] != "-":
+                    # Its connect was written without a source (no handshake within
+                    # the wait): the source comes as a roam line.
+                    self._roam_last[pubkey] = ts
+                    self._write_roam(ts, pubkey, "-", "-")
             self._prune_locked(ts)
             return
 

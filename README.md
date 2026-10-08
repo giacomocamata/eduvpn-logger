@@ -40,7 +40,8 @@ peer state:
 - **connect**: a peer completes a handshake on a new endpoint. The line is held
   for up to 10 s until the portal event or the portal DB names the user. A
   session announced by the portal is written at its first handshake, so with
-  its source; with no handshake within 2 minutes it is written without one.
+  its source; with no handshake within 2 minutes it is written without one,
+  and the source follows in a roam line when the handshake comes.
 - **roam**: the source IP of an active peer changes. Port-only changes (NAT
   rebinding) are ignored. At most one roam line per peer every 30 s: a move
   within that interval is written when it ends, with the time it happened,

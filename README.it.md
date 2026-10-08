@@ -41,7 +41,8 @@ stato dei peer letto periodicamente:
   trattenuta fino a 10 s, finché l'evento del portale o il suo database indicano
   l'utente. Una sessione annunciata dal portale viene scritta al primo
   handshake, quindi con la sua provenienza; senza handshake entro 2 minuti viene
-  scritta senza.
+  scritta senza, e la provenienza compare in una riga roam all'arrivo
+  dell'handshake.
 - **roam**: cambia l'IP di provenienza di un peer attivo. I cambi della sola porta
   (rebinding NAT) sono ignorati. Al massimo una riga roam per peer ogni 30 s: uno
   spostamento dentro quell'intervallo viene scritto quando finisce, con l'ora in
