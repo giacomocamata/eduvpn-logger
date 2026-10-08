@@ -621,11 +621,11 @@ class Correlator:
                 _log_err("write log file", e)
             if _syslog is not None:
                 try:
-                    if " " in line:
-                        _ts, msg = line.split(" ", 1)
-                        _syslog.syslog(_syslog.LOG_INFO, msg)
-                    else:
-                        _syslog.syslog(_syslog.LOG_INFO, line)
+                    # Syslog stamps the time the line is written, which can be later
+                    # than the event (held connects, replayed portal events): the
+                    # event time travels in the ts key.
+                    ts, _sep, msg = line.partition(" ")
+                    _syslog.syslog(_syslog.LOG_INFO, f'{msg} ts="{ts}"')
                 except Exception:
                     pass
 
@@ -1064,6 +1064,12 @@ class Correlator:
         # ponytail: time proximity is a heuristic; concurrent TCP starts within a few
         # seconds can be swapped (see README "Limitations").
         # Only used to attribute a NEW tunnel (connect/roam): the match is consumed.
+        # A tunnel carries WireGuard within seconds of opening (a roam is seen at most
+        # one poll later), so older starts are left alone: an unclaimed one (a tunnel
+        # that re-opened twice in a poll, a client whose handshake fails) is someone
+        # else's, and taking it when this client's own start is missing would report
+        # a wrong IP as unambiguous.
+        max_age = 30.0 + WG_POLL_SEC
         best: Optional[TcpStartEvent] = None
         best_dt = 10_000.0
         candidates = 0
@@ -1071,7 +1077,7 @@ class Correlator:
             dt = now_ts - ev.ts
             if dt < -3.0:
                 continue
-            if dt > 120.0:
+            if dt > max_age:
                 break
             candidates += 1
             if abs(dt) < best_dt:
@@ -1392,7 +1398,7 @@ def _sys_uid_max(path: str = "/etc/login.defs") -> int:
                 parts = line.split()
                 if len(parts) >= 2 and parts[0] == "SYS_UID_MAX" and parts[1].isdigit():
                     return int(parts[1])
-    except OSError:
+    except (OSError, ValueError):  # ValueError: not UTF-8, or a digit int() rejects
         pass
     return 999
 
@@ -1408,13 +1414,21 @@ def _trusted_portal_entry(entry: dict, uid_max: int) -> bool:
     return isinstance(uid, str) and uid.isdigit() and int(uid) <= uid_max
 
 
+_CURSOR_RE = re.compile(r"[\x21-\x7e]+")
+
+
 def _load_cursor() -> Optional[str]:
     try:
-        with open(CURSOR_PATH, encoding="utf-8") as f:
-            c = f.read().strip()
-        return c or None
+        with open(CURSOR_PATH, "rb") as f:
+            c = f.read().strip().decode("ascii", "replace")
     except OSError:
         return None
+    if c and not _CURSOR_RE.fullmatch(c):
+        # A corrupted state file must not kill the reader (decode error) nor wedge
+        # it (a NUL byte makes every journalctl spawn fail): start from now.
+        _log_err("journal cursor", ValueError(f"{CURSOR_PATH} is not a journal cursor; restarting from now"))
+        return None
+    return c or None
 
 
 def _save_cursor(cursor: str) -> None:

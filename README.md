@@ -261,10 +261,15 @@ sudo EDUVPN_LOG=/tmp/test.log EDUVPN_STATE_DIR=/tmp/eduvpn-test EDUVPN_SYSLOG_ID
 `<ISO-8601 timestamp, µs, UTC offset> key=value ...`. The timestamp is when the
 event happened, not when the line was written, so lines are not strictly in
 timestamp order: a connect held for its source, or a roam held back by the
-30 s limit, can be written up to two minutes later. The lines of one session are always written in order (connect, roam,
-disconnect). Values that may contain `:` or
-spaces are double-quoted; `user` and `profile` are sanitised so they cannot
-inject extra keys. New keys may be added in future versions: ignore unknown ones.
+30 s limit, can be written up to two minutes later. The lines of one session
+are always written in order (connect, roam, disconnect). Values that may
+contain `:` or spaces are double-quoted; `user` and `profile` are sanitised so
+they cannot inject extra keys. New keys may be added in future versions: ignore
+unknown ones.
+
+The syslog copy carries the same keys without the leading timestamp (syslog
+stamps the time the line was written) and adds the event time as
+`ts="<ISO-8601>"`: use that one in the SIEM.
 
 | Field | Events | Meaning |
 |---|---|---|
@@ -276,7 +281,7 @@ inject extra keys. New keys may be added in future versions: ignore unknown ones
 | `src_ip`, `src_port` | all | public source address; `-` if unknown |
 | `src_ip_old`, `src_port_old` | roam | source address before the roam |
 | `transport` | all | `udp`, `tcp` (ProxyGuard) or `unknown` |
-| `tcp_candidates` | connect, roam over `tcp` | tunnel starts the source IP was chosen among; `1` = unambiguous |
+| `tcp_candidates` | connect, roam over `tcp` | tunnel starts the source IP was chosen among; `1` = no other candidate (see [Limitations](#limitations)) |
 | `bytes_in`, `bytes_out` | disconnect | seen from the server (`in` = sent by the client); from the portal, or WireGuard counters for inferred disconnects |
 | `inferred` | connect, disconnect | `1`: derived from WireGuard state, not reported by the portal |
 | `country`, `city` | with GeoIP, public IPs | location of `src_ip` |
@@ -284,11 +289,12 @@ inject extra keys. New keys may be added in future versions: ignore unknown ones
 ## Limitations
 
 - **ProxyGuard source IPs are matched by time.** Apache's tunnel start and the
-  WireGuard handshake share no identifier, so the closest start is used, once.
-  Clients opening TCP tunnels within the same few seconds can be swapped, and
-  `/proxyguard/` is reachable without authentication. Treat `tcp_candidates`
-  above 1 as probable, not certain. UDP source IPs come from the kernel and are
-  exact.
+  WireGuard handshake share no identifier, so the closest start of the previous
+  30 s is used, once. Clients opening TCP tunnels within the same few seconds can
+  be swapped, and `/proxyguard/` is reachable without authentication. Treat
+  `tcp_candidates` above 1 as probable, not certain; `1` holds only if the
+  watcher sees every tunnel start (if one is missing, the start left may be
+  another client's). UDP source IPs come from the kernel and are exact.
 - **Portal events are trusted by sender.** Any local user can write to the
   journal with `logger -t vpn-user-portal`; only entries whose `_UID` (set by
   journald) is a system account (≤ `SYS_UID_MAX`, normally 999: root,

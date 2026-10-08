@@ -264,12 +264,15 @@ sudo EDUVPN_LOG=/tmp/test.log EDUVPN_STATE_DIR=/tmp/eduvpn-test EDUVPN_SYSLOG_ID
 momento in cui l'evento è avvenuto, non quello in cui la riga è stata scritta,
 quindi le righe non sono rigorosamente in ordine di timestamp: una connect
 trattenuta in attesa della provenienza, o un roam rimandato dal limite dei 30 s,
-può essere scritto fino a due minuti dopo.
-Le righe di una stessa sessione sono sempre scritte in ordine (connect, roam,
-disconnect). I
-valori che possono contenere `:` o spazi sono tra virgolette; `user` e `profile`
-sono sanificati, così non possono iniettare chiavi aggiuntive. Versioni future
-possono aggiungere chiavi: ignora quelle sconosciute.
+può essere scritto fino a due minuti dopo. Le righe di una stessa sessione sono
+sempre scritte in ordine (connect, roam, disconnect). I valori che possono
+contenere `:` o spazi sono tra virgolette; `user` e `profile` sono sanificati,
+così non possono iniettare chiavi aggiuntive. Versioni future possono aggiungere
+chiavi: ignora quelle sconosciute.
+
+La copia syslog ha le stesse chiavi senza il timestamp iniziale (syslog registra
+l'ora in cui la riga è stata scritta) e aggiunge l'ora dell'evento come
+`ts="<ISO-8601>"`: nel SIEM usa quella.
 
 | Campo | Eventi | Significato |
 |---|---|---|
@@ -281,7 +284,7 @@ possono aggiungere chiavi: ignora quelle sconosciute.
 | `src_ip`, `src_port` | tutti | indirizzo pubblico di provenienza; `-` se ignoto |
 | `src_ip_old`, `src_port_old` | roam | indirizzo di provenienza prima del roam |
 | `transport` | tutti | `udp`, `tcp` (ProxyGuard) o `unknown` |
-| `tcp_candidates` | connect, roam su `tcp` | aperture di tunnel fra cui è stato scelto l'IP; `1` = non ambiguo |
+| `tcp_candidates` | connect, roam su `tcp` | aperture di tunnel fra cui è stato scelto l'IP; `1` = nessun altro candidato (vedi [Limiti](#limiti)) |
 | `bytes_in`, `bytes_out` | disconnect | dal punto di vista del server (`in` = inviati dal client); dal portale, o dai contatori WireGuard per i disconnect dedotti |
 | `inferred` | connect, disconnect | `1`: dedotto dallo stato di WireGuard, non riportato dal portale |
 | `country`, `city` | con GeoIP, IP pubblici | posizione di `src_ip` |
@@ -290,11 +293,12 @@ possono aggiungere chiavi: ignora quelle sconosciute.
 
 - **Gli IP di provenienza ProxyGuard sono abbinati per tempo.** L'apertura del
   tunnel in Apache e l'handshake WireGuard non condividono alcun identificatore,
-  quindi si usa l'apertura più vicina, una sola volta. Client che aprono tunnel TCP
-  negli stessi pochi secondi possono essere scambiati, e `/proxyguard/` è
-  raggiungibile senza autenticazione. Considera `tcp_candidates` maggiore di 1
-  come probabile, non certo. Gli IP di provenienza UDP arrivano dal kernel e sono
-  esatti.
+  quindi si usa l'apertura più vicina degli ultimi 30 s, una sola volta. Client
+  che aprono tunnel TCP negli stessi pochi secondi possono essere scambiati, e
+  `/proxyguard/` è raggiungibile senza autenticazione. Considera `tcp_candidates`
+  maggiore di 1 come probabile, non certo; `1` vale solo se il watcher vede ogni
+  apertura (se ne manca una, quella rimasta può essere di un altro client). Gli
+  IP di provenienza UDP arrivano dal kernel e sono esatti.
 - **Gli eventi del portale sono attendibili in base al mittente.** Qualunque utente
   locale può scrivere nel journal con `logger -t vpn-user-portal`; sono accettate
   solo le voci il cui `_UID` (impostato da journald) è un account di sistema
