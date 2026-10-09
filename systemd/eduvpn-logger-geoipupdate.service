@@ -1,0 +1,14 @@
+# Installed by eduvpn-logger's install.sh where geoipupdate has no schedule of its
+# own (Debian and Ubuntu ship one): the GeoLite license requires each new database
+# to be in use within 30 days. eduvpn-logger reopens the database when it changes.
+# install.sh writes the absolute path of the geoipupdate it found into ExecStart.
+[Unit]
+Description=GeoIP database update
+Documentation=man:geoipupdate(1)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/GeoIP.conf
+
+[Service]
+Type=oneshot
+ExecStart=geoipupdate

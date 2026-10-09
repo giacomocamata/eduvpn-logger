@@ -1,11 +1,12 @@
 [Unit]
 Description=Watch Apache ErrorLog for ProxyGuard START events
-After=apache2.service
-Wants=apache2.service
+After=apache2.service httpd.service
+Wants=apache2.service httpd.service
 
 [Service]
 Type=simple
-# Adjust the error-log path to your VirtualHost's ErrorLog via
+# install.sh points this at the ErrorLog of the VirtualHost that proxies
+# /proxyguard/ (drop-in 00-errorlog.conf). To use another file:
 # `sudo systemctl edit proxyguard-watcher` (an empty `ExecStart=` line first,
 # then the new one). `-n 0`: never replay old lines as fresh START events.
 # Reads one root-owned log and appends to another: no capabilities, no network.

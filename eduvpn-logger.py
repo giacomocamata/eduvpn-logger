@@ -60,8 +60,12 @@ def _env_float(name: str, default: float) -> float:
 # --------------------------------------------------------------------------- #
 OUT_PATH = os.environ.get("EDUVPN_LOG", "/var/log/eduvpn/eduvpn.log")
 DB_PATH = os.environ.get("EDUVPN_PORTAL_DB", "/var/lib/vpn-user-portal/db.sqlite")
+# Next to Apache's logs: /var/log/apache2 (Debian/Ubuntu) or /var/log/httpd (EL,
+# Fedora). proxyguard-watcher.py applies the same rule: both must agree.
+_APACHE_LOG_DIR = ("/var/log/httpd" if os.path.isdir("/var/log/httpd") and not os.path.isdir("/var/log/apache2")
+                   else "/var/log/apache2")
 PROXYGUARD_START_LOG = os.environ.get(
-    "EDUVPN_PROXYGUARD_START_LOG", "/var/log/apache2/proxyguard_start.log"
+    "EDUVPN_PROXYGUARD_START_LOG", os.path.join(_APACHE_LOG_DIR, "proxyguard_start.log")
 )
 # If set, use this GeoLite2 .mmdb directly; otherwise the usual locations are tried.
 GEOIP_DB = os.environ.get("EDUVPN_GEOIP_DB", "")
@@ -903,22 +907,24 @@ class Correlator:
                 self._virtual_due[pubkey] = (now + CONNECT_GRACE_SEC, float(last_hs))
                 continue
             if pubkey in self._virtual_due:
-                # Connect deferred and not yet emitted; track the latest endpoint and
-                # emit as soon as it can be attributed, or when the grace expires.
-                self._virtual_peers[pubkey] = endpoint
+                # Connect deferred and not yet emitted: written as soon as it can be
+                # attributed, or when the grace expires.
                 attributed = (
                     self._emitted_connect_ts.get(pubkey, 0.0) > 0.0
                     or pubkey in self._pending_connect
                     or self._db.lookup(pubkey) is not None
                 )
                 deadline, first_hs = self._virtual_due[pubkey]
-                if attributed or now >= deadline:
-                    self._virtual_due.pop(pubkey, None)
-                    # Stamp the connect with the handshake that started the session,
-                    # not the (deferred) poll time: accurate, and it keeps the
-                    # ProxyGuard start match tight.
-                    self._handle_wg_event_locked(first_hs, f"{pubkey} connected from {endpoint}")
-                continue
+                if not (attributed or now >= deadline):
+                    continue
+                self._virtual_due.pop(pubkey, None)
+                # With the handshake that started the session and the endpoint it was
+                # first seen at, not the (deferred) poll time and the latest endpoint:
+                # accurate, and it keeps the ProxyGuard start match tight. A move
+                # since then follows below as a roam, so a ProxyGuard tunnel re-opened
+                # meanwhile claims its own start (left unclaimed, it could be matched
+                # to another client).
+                self._handle_wg_event_locked(first_hs, f"{pubkey} connected from {prev}")
             if prev != endpoint:
                 self._virtual_peers[pubkey] = endpoint
                 # Suppress port-only changes (same IP — typical NAT rebind) and
@@ -1442,9 +1448,12 @@ def _save_cursor(cursor: str) -> None:
 
 def _portal_journal_cmd(cursor: Optional[str]) -> list[str]:
     # Resume right after the last processed entry, so portal events logged while
-    # the daemon was down are not lost; with no cursor, start from "now".
+    # the daemon was down are not lost; with no cursor, start from "now". Not with
+    # `-n 0`: combined with `-t`, journalctl -f of systemd 252 (EL 9) misses the
+    # entries of other users (the portal runs as www-data/apache) until the journal
+    # already holds one with that identifier.
     cmd = ["journalctl", "-f", "-o", "json", "-t", "vpn-user-portal", "--no-pager"]
-    return cmd + ([f"--after-cursor={cursor}"] if cursor else ["-n", "0"])
+    return cmd + ([f"--after-cursor={cursor}"] if cursor else ["--since", "now"])
 
 
 def _reader_journal(q: "queue.Queue[Tuple[str, float, Optional[str], Optional[str]]]") -> None:
@@ -1563,9 +1572,9 @@ class GeoIp:
         try:
             import maxminddb  # type: ignore
         except Exception:
-            if GEOIP_DB:
-                # The operator explicitly asked for GeoIP: don't fail silently.
-                _log_err("geoip", RuntimeError("EDUVPN_GEOIP_DB is set but the maxminddb module is not installed"))
+            if GEOIP_DB or any(os.path.exists(p) for p in GEOIP_DEFAULT_PATHS):
+                # GeoIP is wanted (path set, or a database installed): don't fail silently.
+                _log_err("geoip", RuntimeError("a GeoIP database is set up but the maxminddb module is not installed"))
             return
         self._open_database = maxminddb.open_database
 

@@ -15,7 +15,11 @@ import sys
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
-OUT_PATH = os.environ.get("EDUVPN_PROXYGUARD_START_LOG", "/var/log/apache2/proxyguard_start.log")
+# Next to Apache's logs: /var/log/apache2 (Debian/Ubuntu) or /var/log/httpd (EL,
+# Fedora). eduvpn-logger.py applies the same rule: both must agree.
+_APACHE_LOG_DIR = ("/var/log/httpd" if os.path.isdir("/var/log/httpd") and not os.path.isdir("/var/log/apache2")
+                   else "/var/log/apache2")
+OUT_PATH = os.environ.get("EDUVPN_PROXYGUARD_START_LOG", os.path.join(_APACHE_LOG_DIR, "proxyguard_start.log"))
 MATCH = "AH10212: proxy: UoTLV/1: tunnel running"
 
 

@@ -1,6 +1,6 @@
 [Unit]
 Description=eduVPN correlated log (vpn-user-portal + proxyguard + WireGuard)
-After=network.target apache2.service
+After=network.target apache2.service httpd.service
 
 [Service]
 Type=simple
