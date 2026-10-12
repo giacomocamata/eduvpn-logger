@@ -22,6 +22,22 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 warn() { echo "WARN: $*" >&2; }
 same() { [ -f "$2" ] && [ "$(cat "$1")" = "$(cat "$2")" ]; }  # no cmp: diffutils may be missing
+# A file administrators may adapt (log retention, forwarding to a SIEM): installed
+# when missing or still as an earlier release shipped it (sha256 listed), kept
+# otherwise. Succeeds only when it was (re)installed.
+install_conf() {  # src dst [sha256 of earlier shipped versions...]
+    local src=$1 dst=$2 sum
+    shift 2
+    same "$src" "$dst" && return 1
+    if [ -f "$dst" ]; then
+        sum=$(sha256sum "$dst" | cut -d' ' -f1)
+        case " $* " in
+            *" $sum "*) ;;
+            *) warn "kept $dst: changed locally (the new version is $src)"; return 1 ;;
+        esac
+    fi
+    install -m 0644 "$src" "$dst"
+}
 
 echo "==> Installing dependencies"
 # wireguard-tools, python3 and logrotate (the log holds personal data: its
@@ -85,8 +101,10 @@ keep_local_settings proxyguard-watcher.service
 install -m 0644 "$SRC/systemd/eduvpn-logger.service" "$UNITS/eduvpn-logger.service"
 install -m 0644 "$SRC/systemd/proxyguard-watcher.service" "$UNITS/proxyguard-watcher.service"
 
-# The VirtualHost that proxies /proxyguard/ (eduVPN's own), if any.
-PG_VHOST=$(grep -lsE '^[^#]*ProxyPass[^#]*/proxyguard/' /etc/apache2/sites-enabled/* /etc/httpd/conf.d/*.conf 2>/dev/null | head -n 1 || true)
+# The VirtualHost that proxies ProxyGuard (eduVPN's own), if any: /proxyguard/
+# as eduVPN documents it, or any path upgraded to ProxyGuard's protocol (proxyUrl).
+PG_RE='^[^#]*ProxyPass[^#]*(/proxyguard/|upgrade=UoTLV)'
+PG_VHOST=$(grep -lsE "$PG_RE" /etc/apache2/sites-enabled/* /etc/httpd/conf.d/*.conf 2>/dev/null | head -n 1 || true)
 
 # The watcher must follow that VirtualHost's ErrorLog. eduVPN gives it its own
 # (<host>_ssl_error.log on Debian/Ubuntu, logs/<host>_ssl_error_log on EL/Fedora):
@@ -100,7 +118,7 @@ apache_errorlog() {  # plain bash: minimal EL/Fedora systems may have no awk
         while IFS= read -r line || [ -n "$line" ]; do
             if [[ $line =~ ^[[:space:]]*[\<]VirtualHost ]]; then e="" pg=0; fi
             if [[ $line =~ ^[[:space:]]*ErrorLog[[:space:]]+([^[:space:]]+) ]]; then e=${BASH_REMATCH[1]}; fi
-            if [[ $line =~ ^[^#]*ProxyPass[^#]*/proxyguard/ ]]; then pg=1; fi
+            if [[ $line =~ $PG_RE ]]; then pg=1; fi
             if [[ $line =~ ^[[:space:]]*[\<]/VirtualHost ]] && [ "$pg" = 1 ] && [ -n "$e" ]; then log=$e; break; fi
         done <"$PG_VHOST"
     fi
@@ -108,13 +126,19 @@ apache_errorlog() {  # plain bash: minimal EL/Fedora systems may have no awk
     log=${log//'${APACHE_LOG_DIR}'//var/log/apache2}
     case $log in
         "") [ -d /var/log/apache2 ] || { [ -d /var/log/httpd ] && log=/var/log/httpd/error_log; } ;;
-        \|* | syslog*) log="" ;;  # piped or sent to syslog: nothing to follow
+        \|* | syslog*) echo "$log"; return ;;  # piped or sent to syslog: nothing to follow
         /*) ;;
         *) log="$root/$log" ;;    # relative to ServerRoot
     esac
     [ -z "$log" ] || readlink -f "$log" || echo "$log"
 }
 WATCH_LOG=$(apache_errorlog || true)
+case $WATCH_LOG in
+    \|* | syslog*)
+        warn "the ProxyGuard VirtualHost logs its errors to \"$WATCH_LOG\": proxyguard-watcher needs a file"
+        NOTES+=("Have proxyguard-watcher read the ProxyGuard VirtualHost's errors from a file (README: Manual setup).")
+        WATCH_LOG="" ;;
+esac
 if [ -n "$WATCH_LOG" ] && [ "$WATCH_LOG" != /var/log/apache2/error.log ]; then
     install -d "$UNITS/proxyguard-watcher.service.d"
     printf '[Service]\nExecStart=\nExecStart=/bin/sh -c '\''exec tail -n 0 -F "%s" | python3 -u %s/proxyguard-watcher.py'\''\n' \
@@ -130,7 +154,9 @@ install -d -m 2750 -o root -g adm /var/log/eduvpn
 
 if [ -d /etc/logrotate.d ]; then
     echo "==> Installing logrotate policy"
-    install -m 0644 "$SRC/examples/logrotate-eduvpn" /etc/logrotate.d/eduvpn-logger
+    # Its retention (rotate 180) is meant to be adapted: an upgrade keeps it.
+    install_conf "$SRC/examples/logrotate-eduvpn" /etc/logrotate.d/eduvpn-logger \
+        7a0efd7268fcc75da2c832b2915360b68db6a2373cabc5eadc401a6d850d81f3 || true
 else
     warn "logrotate not installed: /var/log/eduvpn will not be rotated (install it, re-run)"
 fi
@@ -140,15 +166,15 @@ if [ -d /etc/rsyslog.d ] && grep -iqsE '^[[:space:]]*([$]PrivDropToUser|global\(
     # 2750 log directory; the snippet would only make the events vanish from
     # /var/log/syslog (its "& stop"). They stay in the journal and eduvpn.log.
     echo "==> rsyslog drops privileges here: no rsyslog file (events: journalctl -t eduvpn-logger)"
-    if [ -f /etc/rsyslog.d/10-eduvpn.conf ]; then
+    if same "$SRC/examples/rsyslog-10-eduvpn.conf" /etc/rsyslog.d/10-eduvpn.conf; then  # ours, as shipped
         rm -f /etc/rsyslog.d/10-eduvpn.conf
         systemctl restart rsyslog 2>/dev/null || warn "could not restart rsyslog"
     fi
 elif [ -d /etc/rsyslog.d ]; then
     echo "==> Installing rsyslog snippet"
-    # Restart the system logger only when the snippet actually changed.
-    if ! same "$SRC/examples/rsyslog-10-eduvpn.conf" /etc/rsyslog.d/10-eduvpn.conf; then
-        install -m 0644 "$SRC/examples/rsyslog-10-eduvpn.conf" /etc/rsyslog.d/10-eduvpn.conf
+    # Restart the system logger only when the snippet actually changed; one adapted
+    # locally (e.g. forwarding to a SIEM) is kept.
+    if install_conf "$SRC/examples/rsyslog-10-eduvpn.conf" /etc/rsyslog.d/10-eduvpn.conf; then
         systemctl restart rsyslog 2>/dev/null || warn "could not restart rsyslog"
     fi
 else
@@ -240,8 +266,8 @@ else
 fi
 
 # ProxyGuard: Apache logs a tunnel start (client address) only with the proxy
-# module at trace1 for /proxyguard/. A conf file of its own, not an edit of the
-# eduVPN VirtualHost; skipped if the administrator already traces it.
+# module at trace1 for ProxyGuard's requests. A conf file of its own, not an edit
+# of the eduVPN VirtualHost; skipped if the administrator already traces it.
 if [ -n "$PG_VHOST" ]; then
     if [ -d /etc/apache2/conf-available ]; then
         PG_CONF=/etc/apache2/conf-available/eduvpn-logger-proxyguard.conf APACHECTL=apache2ctl APACHE_UNIT=apache2
@@ -252,28 +278,35 @@ if [ -n "$PG_VHOST" ]; then
     cat >"$PG_NEW" <<'APACHE'
 # Installed by eduvpn-logger's install.sh. When a ProxyGuard tunnel opens, Apache
 # logs one line with the client's address (AH10212) to the VirtualHost's ErrorLog;
-# proxyguard-watcher turns it into a tunnel-start event.
+# proxyguard-watcher turns it into a tunnel-start event. Only ProxyGuard's own
+# requests (whatever their path) and only mod_proxy's level are raised.
 <IfModule proxy_module>
-    <LocationMatch "^/proxyguard/">
-        LogLevel warn proxy:trace1
-    </LocationMatch>
+    <If "%{HTTP:Upgrade} =~ /^UoTLV/i">
+        LogLevel proxy:trace1
+    </If>
 </IfModule>
 APACHE
     if grep -RlsE '^[^#]*proxy:trace[1-8]' /etc/apache2/sites-enabled /etc/apache2/conf-enabled /etc/httpd/conf.d 2>/dev/null \
         | grep -qv eduvpn-logger-proxyguard; then
         echo "==> ProxyGuard: Apache already traces tunnel starts"
     elif ! same "$PG_NEW" "$PG_CONF"; then
+        PG_OLD=$(mktemp)
+        [ ! -f "$PG_CONF" ] || cat "$PG_CONF" >"$PG_OLD"
         install -m 0644 "$PG_NEW" "$PG_CONF"
         [ "$APACHE_UNIT" = apache2 ] && a2enconf -q eduvpn-logger-proxyguard >/dev/null
         if $APACHECTL configtest >/dev/null 2>&1; then
             systemctl try-reload-or-restart "$APACHE_UNIT.service"
             echo "==> ProxyGuard: Apache traces tunnel starts ($PG_CONF; $APACHE_UNIT reloaded)"
+        elif [ -s "$PG_OLD" ]; then
+            cat "$PG_OLD" >"$PG_CONF"  # an upgrade: the version Apache accepted stays
+            warn "Apache rejected the new $PG_CONF (configtest failed): the previous one is kept"
         else
             [ "$APACHE_UNIT" = apache2 ] && a2disconf -q eduvpn-logger-proxyguard
             rm -f "$PG_CONF"
             warn "Apache rejected $PG_CONF (configtest failed): removed"
-            NOTES+=("Make Apache trace /proxyguard/ by hand (README: Manual setup).")
+            NOTES+=("Make Apache trace ProxyGuard's requests by hand (README: Manual setup).")
         fi
+        rm -f "$PG_OLD"
     fi
     rm -f "$PG_NEW"
     echo "==> proxyguard-watcher follows $WATCH_LOG"
@@ -351,19 +384,33 @@ if [ -f "$PORTAL_CONF" ] && command -v php >/dev/null 2>&1; then
         *) row "portal log" "unreadable" ;;
     esac
 fi
-row "portal DB" "$(python3 - <<'PY' 2>/dev/null || echo "not readable"
-import sqlite3
-c = sqlite3.connect("file:/var/lib/vpn-user-portal/db.sqlite?mode=ro", uri=True)
+# The portal DB is read (as a fallback) only when it is SQLite: eduVPN can also use
+# PostgreSQL or MariaDB. Only the driver is shown: the DSN may hold a password.
+DB_KIND=""
+if [ -f "$PORTAL_CONF" ] && command -v php >/dev/null 2>&1; then
+    DB_KIND=$(php -r '$c = require $argv[1]; echo strtok((is_array($c) && isset($c["Db"]["dbDsn"])) ? (string) $c["Db"]["dbDsn"] : "", ":");' \
+        "$PORTAL_CONF" 2>/dev/null || true)
+fi
+DB_PATH=$(systemctl show -p Environment --value eduvpn-logger.service 2>/dev/null | tr ' ' '\n' \
+    | sed -n 's/^EDUVPN_PORTAL_DB=//p' | tail -n 1 || true)
+case $DB_KIND in
+    "" | sqlite)
+        row "portal DB" "$(python3 - "${DB_PATH:-/var/lib/vpn-user-portal/db.sqlite}" <<'PY' 2>/dev/null || echo "not readable"
+import sqlite3, sys, urllib.parse
+c = sqlite3.connect(f"file:{urllib.parse.quote(sys.argv[1])}?mode=ro", uri=True)
 n = c.execute("SELECT COUNT(*) FROM wg_peers").fetchone()[0]
 print(f"ok ({n} WireGuard configurations)")
 PY
-)"
+)" ;;
+    *) row "portal DB" "$DB_KIND: not read (users come from the portal's events only, see README: Limitations)" ;;
+esac
 WG_IFS=$(wg show interfaces 2>/dev/null | tr -s ' ' ',' || true)
 row WireGuard "${WG_IFS:-no interface up (yet)}"
 if [ -n "$PG_VHOST" ]; then
     row ProxyGuard "watcher $(systemctl is-active proxyguard-watcher.service || true), following $WATCH_LOG"
+    [ -f "$WATCH_LOG" ] || NOTES+=("proxyguard-watcher follows $WATCH_LOG, which does not exist: point it at the ProxyGuard VirtualHost's ErrorLog (README: Manual setup).")
 else
-    row ProxyGuard "not in use (no VirtualHost proxies /proxyguard/)"
+    row ProxyGuard "not in use (no VirtualHost proxies it)"
 fi
 GEO=$(ls /usr/local/share/GeoIP/GeoLite2-City.mmdb /usr/share/GeoIP/GeoLite2-City.mmdb /var/lib/GeoIP/GeoLite2-City.mmdb 2>/dev/null | head -n 1 || true)
 if [ -z "$GEO" ]; then

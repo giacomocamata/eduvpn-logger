@@ -44,6 +44,7 @@ def parse_line(line: str) -> Optional[Tuple[str, str]]:
 def main() -> None:
     # Bytes, decoded leniently: one invalid UTF-8 sequence in Apache's log must
     # not crash the watcher (strict decoding of stdin would).
+    warned = False
     for raw in sys.stdin.buffer:
         parsed = parse_line(raw.decode("utf-8", "replace"))
         if parsed is None:
@@ -51,9 +52,16 @@ def main() -> None:
         ip, port = parsed
         ts = datetime.now(timezone.utc).astimezone().isoformat(timespec="microseconds")
         out_line = f"{ts} product=eduVPN proto=proxyguard event=start src_ip={ip} src_port={port}\n"
-        with open(OUT_PATH, "a", encoding="utf-8") as f:
-            f.write(out_line)
-            f.flush()
+        try:
+            with open(OUT_PATH, "a", encoding="utf-8") as f:
+                f.write(out_line)
+            warned = False
+        except OSError as e:
+            # Disk full, directory gone: say it once, keep reading (a crash would
+            # restart `tail -n 0` and lose the lines in between).
+            if not warned:
+                warned = True
+                print(f"[proxyguard-watcher] cannot write {OUT_PATH}: {e!r}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

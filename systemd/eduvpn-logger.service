@@ -1,6 +1,9 @@
 [Unit]
 Description=eduVPN correlated log (vpn-user-portal + proxyguard + WireGuard)
 After=network.target apache2.service httpd.service
+# Restarted however often it fails: the default start limit (5 in 10 s, with
+# RestartSec=2) would leave it stopped for good.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -16,8 +19,9 @@ RestartSec=2
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN
 # New files (the log) are 0640: they hold personal data.
 UMask=0027
-# /var/lib/eduvpn-logger: journald cursor, so portal events logged while the
-# daemon is down are replayed on start (EDUVPN_STATE_DIR).
+# /var/lib/eduvpn-logger (EDUVPN_STATE_DIR): the journald cursor, so portal
+# events logged while the daemon is down are replayed on start, and the open
+# sessions, saved on stop and restored on start.
 StateDirectory=eduvpn-logger
 StateDirectoryMode=0750
 NoNewPrivileges=yes

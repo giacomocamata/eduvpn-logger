@@ -104,9 +104,12 @@ reale.
   eventi CONNECT del portale stesso; il database del portale, aperto in sola
   lettura e con lo schema riconosciuto a runtime, supplisce quando un evento
   manca.
-- **Nessun evento del portale perso.** La posizione nel journal viene salvata
-  dopo ogni evento del portale: gli eventi registrati mentre il daemon era
-  fermo vengono elaborati al suo avvio, con il loro timestamp originale.
+- **Riavvii senza strappi.** La posizione nel journal viene salvata dopo ogni
+  evento del portale, e le sessioni aperte quando il servizio si ferma: dopo
+  un aggiornamento o un riavvio del server gli eventi registrati nel frattempo
+  vengono elaborati per primi, con il loro timestamp originale, le sessioni
+  attive proseguono senza una seconda `connect` e quelle terminate nel
+  frattempo ricevono la loro `disconnect`.
 - **Costruito sul comportamento reale di eduVPN.** I peer ricreati da
   `vpn-maint-apply-changes` (contatori azzerati, nessun handshake) non chiudono
   le loro sessioni né perdono il traffico totalizzato. Una public key riusata
@@ -116,7 +119,8 @@ reale.
   portale mentre `wg show` è in corso non viene riaperta.
 - **Adatto ai SIEM.** Una riga per evento, chiavi in ordine fisso, l'ora
   dell'evento riportata nella copia syslog, e i valori forniti dagli utenti
-  sanificati, così non possono falsificare chiavi.
+  sanificati, così non possono falsificare chiavi, mentre gli identificativi
+  federati (eduPersonTargetedID, pairwise-id) restano intatti.
 - **Sicuro per impostazione predefinita.** Gli eventi del portale sono
   accettati solo da account di sistema, in base all'UID del mittente che
   journald registra e che il mittente non può falsificare. Il servizio gira in
@@ -176,11 +180,15 @@ dallo stato dei peer letto a ogni interrogazione:
   portale, con i suoi contatori di traffico. Altrimenti (client WireGuard
   generico, portatile in sospensione, rete persa) la sessione termina dopo
   180 s senza handshake, la durata delle chiavi di WireGuard, con i contatori
-  di WireGuard.
+  di WireGuard, e porta l'ora dell'ultimo handshake più 180 s. Nuovo traffico
+  sulla stessa chiave apre una nuova sessione dello stesso utente.
 
 Utente, profilo e indirizzi del tunnel vengono dall'evento CONNECT del
 portale, oppure dal database del portale tramite la public key; `-` se nessuno
-dei due la conosce. `device` deriva dall'ID client OAuth delle app eduVPN,
+dei due la conosce. Una sessione annunciata dal portale resta aperta fino al
+suo DISCONNECT, per quanto tardi arrivi l'handshake: una configurazione
+scaricata dal portale e usata per la prima volta giorni dopo riceve la
+provenienza in una riga `roam`. `device` deriva dall'ID client OAuth delle app eduVPN,
 Let's Connect! e govVPN, così come lo registra il portale. Le righe connect e
 disconnect non supportate da un evento del portale hanno **`inferred=1`** (le
 righe roam vengono sempre da WireGuard).
@@ -208,7 +216,8 @@ sequenceDiagram
     Note over L: apertura non reclamata<br/>più vicina<br/>src_ip=192.0.2.77<br/>tcp_candidates=1
 ```
 
-Con il trace che `install.sh` attiva, Apache scrive una riga all'apertura di
+Con il trace che `install.sh` attiva (solo per le richieste di ProxyGuard,
+qualunque sia il loro percorso), Apache scrive una riga all'apertura di
 un tunnel (`AH10212 ... tunnel running`, con `[client IP:porta]`) e
 `proxyguard-watcher` la trasforma in un evento di apertura. Una nuova sessione
 WireGuard, o un nuovo tunnel di una sessione attiva, viene abbinata
@@ -232,12 +241,19 @@ c'erano nella finestra: `1` significa che non c'erano altri candidati.
 
 ### Stato
 
-La posizione nel journal è conservata in `/var/lib/eduvpn-logger`. Tutto il
-resto è in memoria e limitato alle sessioni attive: a ogni lettura viene
-riallineato con `wg show`. Dopo un riavvio le sessioni ancora attive vengono
-annunciate di nuovo (vedi [Limiti](#limiti)); una posizione nel journal
-corrotta o scaduta viene riconosciuta, segnalata, e la lettura riparte dal
-momento attuale.
+`/var/lib/eduvpn-logger` conserva la posizione nel journal e, mentre il
+servizio è fermo, le sessioni aperte (`sessions.json`, leggibile solo da
+root). All'avvio le sessioni vengono ripristinate e il file rimosso, si
+elaborano gli eventi del portale registrati nel frattempo, e solo dopo si legge
+WireGuard: una sessione chiusa dal portale nel frattempo riceve la disconnect
+del portale, una rimasta in silenzio quella dedotta, una attiva prosegue (una
+sessione ProxyGuard conserva il suo indirizzo reale). Tutto il resto è in
+memoria e limitato alle sessioni attive: a ogni lettura viene riallineato con
+`wg show`, e il lavoro di ogni lettura cresce linearmente con il numero di
+peer. Dopo un crash non c'è stato salvato: le sessioni ancora attive vengono
+annunciate di nuovo (vedi [Limiti](#limiti)). Una posizione nel journal
+corrotta o scaduta, o un `sessions.json` inutilizzabile, viene riconosciuta,
+segnalata, e il daemon riparte dal momento attuale.
 
 ## Requisiti
 
@@ -252,6 +268,9 @@ momento attuale.
   (entrambi installati da `install.sh` se mancano).
 - I template di connect/disconnect (consigliati) richiedono vpn-user-portal ≥
   3.5.0; anche il formato di log predefinito del portale è riconosciuto.
+- Il database del portale viene letto solo se è SQLite, il default di eduVPN.
+  Con PostgreSQL o MariaDB tutto funziona dagli eventi del portale, senza il
+  ripiego sul database (vedi [Limiti](#limiti)).
 - *Opzionale:* `python3-maxminddb` e un database MaxMind GeoLite2-City per
   `country` e `city` ([GeoIP](#geoip-opzionale)).
 
@@ -273,11 +292,11 @@ di eduVPN.
 | Parte | Cosa fa `install.sh` |
 |---|---|
 | log delle connessioni del portale | se è spento lo attiva in `/etc/vpn-user-portal/config.php` con i template consigliati. La modifica viene verificata con PHP prima di sostituire il file, l'originale resta in `config.php.eduvpn-logger.bak` e i template già impostati restano com'erano. |
-| IP di provenienza ProxyGuard | se un VirtualHost inoltra `/proxyguard/`: fa registrare ad Apache le aperture dei tunnel, con un file di configurazione proprio (`eduvpn-logger-proxyguard.conf`, poi `configtest` e reload graceful; rimosso se il `configtest` fallisce), e avvia `proxyguard-watcher` sull'`ErrorLog` di quel VirtualHost |
+| IP di provenienza ProxyGuard | se un VirtualHost inoltra ProxyGuard (`/proxyguard/`, o qualunque percorso con upgrade a `UoTLV`): fa registrare ad Apache le aperture dei tunnel, con un file di configurazione proprio (`eduvpn-logger-proxyguard.conf`, poi `configtest` e reload graceful; se il `configtest` fallisce resta la versione precedente, o nessuna), e avvia `proxyguard-watcher` sull'`ErrorLog` di quel VirtualHost |
 | pacchetti | `wireguard-tools`, `python3`, `logrotate`; opzionali `python3-maxminddb`, `geoipupdate`. Solo quelli mancanti: nulla di già installato viene aggiornato. |
 | programmi, unit | `/usr/local/sbin/eduvpn-logger.py`, `proxyguard-watcher.py`; `/etc/systemd/system/eduvpn-logger.service`, `proxyguard-watcher.service` |
-| log | `/var/log/eduvpn` (`2750 root:adm`), ruotati ogni giorno da `/etc/logrotate.d/eduvpn-logger`. Se rsyslog è installato e gira come root (Debian, EL, Fedora; non Ubuntu), vi scrive anche la copia syslog, in `eduvpn-syslog.log`. |
-| stato | `/var/lib/eduvpn-logger` (posizione nel journal) |
+| log | `/var/log/eduvpn` (`2750 root:adm`), ruotati ogni giorno da `/etc/logrotate.d/eduvpn-logger`. Se rsyslog è installato e gira come root (Debian, EL, Fedora; non Ubuntu), vi scrive anche la copia syslog, in `eduvpn-syslog.log`. Entrambi i file sono tuoi da adattare (conservazione, inoltro): una volta modificati, gli aggiornamenti li mantengono, con un avviso. |
+| stato | `/var/lib/eduvpn-logger` (posizione nel journal; sessioni aperte mentre è fermo) |
 
 Alla fine esegue un controllo:
 
@@ -336,7 +355,7 @@ l'utente e l'IP pubblico di provenienza. Gli avvisi del daemon sono in
 |---|---|
 | nessuna riga | servizio non attivo (`systemctl status eduvpn-logger`), o log delle connessioni del portale spento: riesegui `install.sh` e leggi il controllo finale |
 | `user=-` nelle righe connect | database del portale non trovato o non leggibile: controlla `EDUVPN_PORTAL_DB`; oppure peer di un'interfaccia WireGuard non eduVPN: imposta `EDUVPN_WG_INTERFACES` |
-| `transport=tcp src_ip="-"` | Apache non traccia `/proxyguard/`, o il watcher legge l'`ErrorLog` sbagliato: riesegui `install.sh` (anche dopo aver cambiato il VirtualHost), poi guarda `systemctl cat proxyguard-watcher` e la coda di `proxyguard_start.log` |
+| `transport=tcp src_ip="-"`, o l'avviso `ProxyGuard (TCP) session but no tunnel start read` | Apache non traccia le richieste di ProxyGuard, o il watcher legge l'`ErrorLog` sbagliato (o un `ErrorLogFormat` personalizzato senza `[client %a] %M`): riesegui `install.sh` (anche dopo aver cambiato il VirtualHost), poi guarda `systemctl cat proxyguard-watcher` e la coda di `proxyguard_start.log` |
 | avviso `ignoring unparsable/non-WireGuard event` | template personalizzato senza `CONN=`, o evento OpenVPN (ignorato di proposito) |
 | avviso `untrusted _UID=…` | scartato un evento del portale registrato da un account non di sistema (vedi [Limiti](#limiti)) |
 
@@ -376,9 +395,9 @@ Aggiungi al VirtualHost di eduVPN (snippet completo:
 [`examples/apache-proxyguard.conf`](examples/apache-proxyguard.conf)):
 
 ```apache
-<LocationMatch "^/proxyguard/">
-    LogLevel warn proxy:trace1
-</LocationMatch>
+<If "%{HTTP:Upgrade} =~ /^UoTLV/i">
+    LogLevel proxy:trace1
+</If>
 ```
 
 All'apertura di un tunnel Apache scrive allora nell'`ErrorLog` del VirtualHost una
@@ -454,7 +473,7 @@ sudo systemctl restart eduvpn-logger.service
 | `EDUVPN_LOG` | `/var/log/eduvpn/eduvpn.log` | file di output |
 | `EDUVPN_PORTAL_DB` | `/var/lib/vpn-user-portal/db.sqlite` | database del portale (sola lettura) |
 | `EDUVPN_PROXYGUARD_START_LOG` | `/var/log/apache2/proxyguard_start.log` (`/var/log/httpd/…` su EL/Fedora) | file scritto da `proxyguard-watcher` |
-| `EDUVPN_STATE_DIR` | `/var/lib/eduvpn-logger` | posizione nel journal |
+| `EDUVPN_STATE_DIR` | `/var/lib/eduvpn-logger` | posizione nel journal; sessioni aperte mentre il servizio è fermo |
 | `EDUVPN_GEOIP_DB` | *(cercato)* | percorso di `GeoLite2-City.mmdb`; per default cercato in `/usr/local/share/GeoIP`, `/usr/share/GeoIP` e `/var/lib/GeoIP` |
 | `EDUVPN_GEOIP_LANG` | `en` | lingua/e dei nomi dei luoghi, vale la prima disponibile, es. `it,en` |
 | `EDUVPN_SYSLOG_IDENT` | `eduvpn-logger` | nome del programma in syslog |
@@ -483,10 +502,14 @@ trattenuta in attesa della provenienza, o un roam rimandato dal limite dei 30 s,
 può essere scritto fino a due minuti dopo. Le righe di una stessa sessione sono
 sempre scritte in ordine (connect, roam, disconnect). Le chiavi hanno un ordine
 fisso; quelle opzionali mancano quando non si applicano, e i valori ignoti sono
-`-`. I valori che possono contenere `:` o spazi sono tra virgolette; `user` e
-`profile` sono sanificati (spazi, virgolette, `=` e caratteri di controllo
-diventano `_`), così non possono iniettare chiavi aggiuntive. Versioni future
-possono aggiungere chiavi: ignora quelle sconosciute.
+`-`. I valori che possono contenere `:` o spazi sono tra virgolette; i valori
+che arrivano dal portale o dall'IdP (`user`, `profile`, indirizzi del tunnel,
+contatori di byte) sono sanificati: spazi, virgolette doppie e caratteri di
+controllo diventano `_`, così non possono iniettare chiavi aggiuntive. `=` resta,
+come in
+`user=https://idp.example.org/idp/shibboleth!https://vpn.example.org/...!xEfu4jG6kKnf=`
+(eduPersonTargetedID): dentro un valore non apre una nuova chiave. Versioni
+future possono aggiungere chiavi: ignora quelle sconosciute.
 
 La copia syslog (facility `local0`, priorità `info`) ha le stesse chiavi senza
 il timestamp iniziale, perché syslog registra l'ora in cui la riga è stata
@@ -549,17 +572,32 @@ zgrep -h ' event=connect .*country=' /var/log/eduvpn/eduvpn.log* | grep -v 'coun
   maggiore di 1 come probabile, non certo; `1` vale solo se il watcher vede ogni
   apertura (se ne manca una, quella rimasta può essere di un altro client). Gli
   IP di provenienza UDP arrivano dal kernel e sono esatti.
+- **Gli indirizzi sono quelli che vede il server.** Un bilanciatore, firewall o
+  reverse proxy davanti al server che riscrive gli indirizzi di provenienza
+  (SNAT) nasconde i client dietro il proprio indirizzo. Per ProxyGuard dietro un
+  reverse proxy HTTP, fai registrare ad Apache il client reale con
+  `mod_remoteip` (`[client %a]` è allora l'indirizzo del client).
 - **Gli eventi del portale sono attendibili in base al mittente.** Qualunque utente
   locale può scrivere nel journal con `logger -t vpn-user-portal`; sono accettate
   solo le voci il cui `_UID` (impostato da journald) è un account di sistema
   (≤ `SYS_UID_MAX`, normalmente 999: root, `www-data`, `apache`).
 - **I disconnect dedotti** vengono scritti, e datati, quando si supera la soglia
   di 180 s di silenzio, cioè fino a 3 minuti dopo l'ultima attività.
-- **Dopo un riavvio** il daemon non sa quali sessioni aveva già registrato: i peer
-  attivi ricevono una nuova `connect` con `inferred=1`, datata al loro ultimo
-  handshake (fino a 3 minuti prima) e con la provenienza vista dopo il riavvio;
-  per le sessioni ProxyGuard `src_ip="-"` (la riga scritta prima del riavvio
-  contiene l'IP). I roam avvenuti mentre era fermo non vengono visti.
+- **Mentre il daemon è fermo** i roam non vengono seguiti (una sessione che si
+  è spostata viene riportata una volta, da dov'era a dov'è, alla ripartenza), né
+  gli handshake che WireGuard nel frattempo dimentica: se l'interfaccia viene
+  ricreata durante il fermo (riavvio del server, `vpn-maint-apply-changes`), una
+  sessione il cui ultimo handshake noto ha più di 180 s termina lì, e il suo
+  traffico successivo ne apre una nuova.
+- **Dopo un crash** (`kill -9`, memoria esaurita, mancanza di corrente) non c'è
+  stato salvato: i peer attivi ricevono una nuova `connect` con `inferred=1`,
+  datata al loro ultimo handshake (fino a 3 minuti prima) e con la provenienza
+  vista dopo la ripartenza; per le sessioni ProxyGuard `src_ip="-"` (la riga
+  scritta prima contiene l'IP).
+- **Database del portale su PostgreSQL o MariaDB**: non viene letto, quindi una
+  sessione senza alcun evento del portale (dopo un crash, o un peer non eduVPN)
+  ha `user=-`. Le sessioni annunciate dal portale, e le nuove sessioni sulle
+  loro chiavi, non ne risentono.
 - **Campionamento.** WireGuard viene letto ogni `EDUVPN_WG_POLL_SEC`: un roam
   con ritorno dentro lo stesso intervallo non viene visto, e una sessione più
   breve di un intervallo resta senza indirizzo di provenienza (connect e
@@ -573,8 +611,9 @@ protezione dei dati (DPO).
 
 - **Accesso**: i log sono creati `0640 root:adm` in una directory `2750`.
 - **Conservazione**: `/etc/logrotate.d/eduvpn-logger` ruota ogni giorno e tiene
-  180 giorni; modifica `rotate` secondo la tua policy. `proxyguard_start.log`
-  segue la rotazione Apache della distribuzione (14 giorni su Debian e Ubuntu).
+  180 giorni; modifica `rotate` secondo la tua policy (gli aggiornamenti
+  mantengono la tua modifica). `proxyguard_start.log` segue la rotazione Apache
+  della distribuzione (14 giorni su Debian e Ubuntu).
 - **Integrità**: chiunque abbia root sul server può alterare un file locale; per un
   uso probatorio inoltra in tempo reale il flusso syslog a un collettore remoto
   (rsyslog `omfwd` su TLS, oppure RELP).
@@ -626,7 +665,7 @@ sudo a2disconf eduvpn-logger-proxyguard && sudo rm /etc/apache2/conf-available/e
 sudo rm /etc/httpd/conf.d/eduvpn-logger-proxyguard.conf && sudo systemctl reload httpd  # EL/Fedora
 ```
 
-(oppure il blocco `LocationMatch`, se l'avevi aggiunto a mano al VirtualHost). Il
+(oppure il blocco che avevi aggiunto a mano al VirtualHost). Il
 log delle connessioni del portale resta attivo; se l'aveva attivato `install.sh`,
 il `config.php` precedente è in `config.php.eduvpn-logger.bak`.
 
@@ -635,24 +674,29 @@ il `config.php` precedente è in `config.php.eduvpn-logger.bak`.
 **Modifica eduVPN?** Legge soltanto il journal e il database del portale, lo
 stato di WireGuard e il log di Apache. `install.sh` cambia due impostazioni, e
 solo se sono spente: il log delle connessioni del portale e, con ProxyGuard, il
-livello di log di Apache per `/proxyguard/`. Entrambe vengono verificate prima
+livello di log di Apache per le richieste di ProxyGuard. Entrambe vengono verificate prima
 di essere applicate.
 
-**Quanto pesa?** Un `wg show all dump` ogni 2 s e poche query SQLite in sola
-lettura per ogni nuova sessione. La memoria cresce con il numero di sessioni
-attive.
+**Quanto pesa?** Un `wg show all dump` ogni 2 s e una query SQLite in sola
+lettura per ogni nuova sessione (qualcuna per un peer che il portale non
+conosce). Memoria e CPU crescono linearmente con il numero di peer, e ogni
+evento del portale o apertura di tunnel costa lo stesso qualunque sia il numero
+di sessioni aperte: con 10.000 peer una lettura richiede circa 20 ms, e
+riannunciarli tutti dopo un crash circa 2 s.
 
 **E OpenVPN?** Il portale registra già l'indirizzo di provenienza delle
 sessioni OpenVPN (`originatingIp`); eduvpn-logger le ignora.
 
-**L'IP di provenienza è affidabile?** Su UDP sì: arriva dal kernel. Su
+**L'IP di provenienza è affidabile?** Su UDP sì: arriva dal kernel (così come
+lo vede il server, vedi [Limiti](#limiti)). Su
 ProxyGuard è un abbinamento per tempo, e `tcp_candidates` dice quanti tunnel
 erano possibili.
 
 **Cosa succede mentre il logger è fermo?** Gli eventi del portale vengono
-elaborati alla ripartenza, con il loro timestamp originale; i roam avvenuti nel
-frattempo non vengono visti, e le sessioni ancora attive vengono annunciate di
-nuovo con `inferred=1`.
+elaborati alla ripartenza, con il loro timestamp originale. Le sessioni ancora
+attive proseguono senza una nuova `connect`; quelle terminate nel frattempo
+ricevono la loro `disconnect`; i roam intermedi non vengono visti. Solo dopo un
+crash le sessioni attive vengono annunciate di nuovo, con `inferred=1`.
 
 **Più nodi eduVPN?** Non supportati: portale e WireGuard devono girare sulla
 stessa macchina.
