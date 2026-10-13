@@ -3,7 +3,8 @@
 # Enterprise Linux, Fedora). Idempotent: safe to re-run, also to upgrade.
 #
 #   sudo ./install.sh
-#   sudo GEOIP_ACCOUNT_ID=123456 GEOIP_LICENSE_KEY=xxxxxxxx ./install.sh   # with GeoIP
+#   sudo GEOIP_ACCOUNT_ID=123456 ./install.sh    # with GeoIP (the license key is asked for)
+#   sudo ./install.sh --uninstall
 #
 # Besides the logger it turns on, when missing, what it needs on the eduVPN side:
 # the portal's connection log (config.php, backup kept) and, with ProxyGuard,
@@ -16,9 +17,18 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 PORTAL_CONF=/etc/vpn-user-portal/config.php
 NOTES=()  # what is left to the administrator, printed at the end
 
+case ${1:-} in
+    "" | --uninstall) ;;
+    *) echo "Usage: sudo ./install.sh [--uninstall]" >&2; exit 2 ;;
+esac
 if [ "$(id -u)" -ne 0 ]; then
     echo "Run as root: sudo ./install.sh" >&2
     exit 1
+fi
+if [ -d /etc/apache2/conf-available ]; then
+    PG_CONF=/etc/apache2/conf-available/eduvpn-logger-proxyguard.conf APACHECTL=apache2ctl APACHE_UNIT=apache2
+else
+    PG_CONF=/etc/httpd/conf.d/eduvpn-logger-proxyguard.conf APACHECTL=apachectl APACHE_UNIT=httpd
 fi
 warn() { echo "WARN: $*" >&2; }
 same() { [ -f "$2" ] && [ "$(cat "$1")" = "$(cat "$2")" ]; }  # no cmp: diffutils may be missing
@@ -39,6 +49,34 @@ install_conf() {  # src dst [sha256 of earlier shipped versions...]
     install -m 0644 "$src" "$dst"
 }
 
+if [ "${1:-}" = --uninstall ]; then
+    echo "==> Removing eduvpn-logger"
+    # One at a time: a unit that is not there (the GeoIP timer often) must not
+    # keep the others running.
+    for u in eduvpn-logger.service proxyguard-watcher.service eduvpn-logger-geoipupdate.timer; do
+        systemctl disable --now "$u" >/dev/null 2>&1 || true
+    done
+    rm -rf "$SBIN/eduvpn-logger.py" "$SBIN/proxyguard-watcher.py" "$UNITS"/eduvpn-logger.service* \
+        "$UNITS"/proxyguard-watcher.service* "$UNITS"/eduvpn-logger-geoipupdate.* \
+        /etc/logrotate.d/eduvpn-logger /var/lib/eduvpn-logger
+    if same "$SRC/examples/rsyslog-10-eduvpn.conf" /etc/rsyslog.d/10-eduvpn.conf; then
+        rm -f /etc/rsyslog.d/10-eduvpn.conf
+        systemctl restart rsyslog 2>/dev/null || warn "could not restart rsyslog"
+    elif [ -f /etc/rsyslog.d/10-eduvpn.conf ]; then
+        warn "kept /etc/rsyslog.d/10-eduvpn.conf: changed locally"
+    fi
+    if [ -f "$PG_CONF" ]; then
+        if [ "$APACHE_UNIT" = apache2 ]; then a2disconf -q eduvpn-logger-proxyguard >/dev/null 2>&1 || true; fi
+        rm -f "$PG_CONF"
+        if $APACHECTL configtest >/dev/null 2>&1; then systemctl try-reload-or-restart "$APACHE_UNIT.service" || true; fi
+    fi
+    systemctl daemon-reload
+    echo "==> Removed. Left in place: the logs in /var/log/eduvpn (personal data: delete them as your"
+    echo "    retention policy says), the portal's connection log (config.php as it was before install.sh:"
+    echo "    $PORTAL_CONF.eduvpn-logger.bak, if it turned the log on), /etc/GeoIP.conf, the packages."
+    exit 0
+fi
+
 echo "==> Installing dependencies"
 # wireguard-tools, python3 and logrotate (the log holds personal data: its
 # retention must be enforced) are required. The GeoIP packages are optional and
@@ -47,7 +85,10 @@ echo "==> Installing dependencies"
 # missing packages are installed: installing the logger must not upgrade a live
 # server's python3 or wireguard-tools as a side effect (`dnf install` would).
 if command -v apt-get >/dev/null 2>&1; then
-    PKG="apt-get install -y --no-upgrade"
+    # Never a prompt (there may be no terminal): a configuration file already
+    # there, such as a hand-written /etc/GeoIP.conf, is kept.
+    export DEBIAN_FRONTEND=noninteractive
+    PKG="apt-get install -y --no-upgrade -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
     apt-get update -qq || true
     missing() { ! dpkg-query -W -f '${Status}' "$1" 2>/dev/null | grep -q "ok installed"; }
 elif command -v dnf >/dev/null 2>&1; then
@@ -269,11 +310,6 @@ fi
 # module at trace1 for ProxyGuard's requests. A conf file of its own, not an edit
 # of the eduVPN VirtualHost; skipped if the administrator already traces it.
 if [ -n "$PG_VHOST" ]; then
-    if [ -d /etc/apache2/conf-available ]; then
-        PG_CONF=/etc/apache2/conf-available/eduvpn-logger-proxyguard.conf APACHECTL=apache2ctl APACHE_UNIT=apache2
-    else
-        PG_CONF=/etc/httpd/conf.d/eduvpn-logger-proxyguard.conf APACHECTL=apachectl APACHE_UNIT=httpd
-    fi
     PG_NEW=$(mktemp)
     cat >"$PG_NEW" <<'APACHE'
 # Installed by eduvpn-logger's install.sh. When a ProxyGuard tunnel opens, Apache
@@ -312,14 +348,80 @@ APACHE
     echo "==> proxyguard-watcher follows $WATCH_LOG"
 fi
 
-# GeoIP (optional): MaxMind credentials from the environment, the only thing the
-# installer cannot work out by itself.
+# GeoIP (optional): the MaxMind account, the only thing the installer cannot work
+# out by itself. The license key is asked for when only the account is given, so
+# it stays out of the shell history.
+# geoipupdate is not packaged on Enterprise Linux, and is in Debian's contrib
+# section, often not enabled: MaxMind's own package then, from its latest release
+# and checked against the release's checksums.
+maxmind_geoipupdate() {
+    local arch ext=rpm pkg rc
+    case $(uname -m) in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) return 1 ;; esac
+    [ -n "$PKG" ] || return 1
+    command -v apt-get >/dev/null 2>&1 && ext=deb
+    pkg=$(python3 - "$arch" "$ext" <<'PY'
+import hashlib, json, os, sys, tempfile, urllib.request
+
+arch, ext = sys.argv[1:]
+try:
+    get = lambda url: urllib.request.urlopen(url, timeout=60).read()
+    rel = json.loads(get("https://api.github.com/repos/maxmind/geoipupdate/releases/latest"))
+    urls = {a["name"]: a["browser_download_url"] for a in rel["assets"]}
+    ver = rel["tag_name"].lstrip("v")
+    name = f"geoipupdate_{ver}_linux_{arch}.{ext}"
+    data = get(urls[name])
+    lines = get(urls[f"geoipupdate_{ver}_checksums.txt"]).decode().splitlines()
+    sums = {p[1]: p[0] for p in (line.split() for line in lines) if len(p) == 2}
+    if sums.get(name) != hashlib.sha256(data).hexdigest():
+        raise ValueError(f"{name}: checksum mismatch")
+except Exception as e:
+    sys.exit(f"cannot get geoipupdate from github.com/maxmind/geoipupdate: {e}")
+path = os.path.join(tempfile.mkdtemp(), name)
+with open(path, "wb") as f:
+    f.write(data)
+print(path)
+PY
+    ) || return 1
+    echo "==> GeoIP: installing MaxMind's ${pkg##*/} (github.com/maxmind/geoipupdate)"
+    $PKG "$pkg" && rc=0 || rc=1
+    rm -rf "${pkg%/*}"
+    return "$rc"
+}
+if [ -n "${GEOIP_ACCOUNT_ID:-}" ] && [ -z "${GEOIP_LICENSE_KEY:-}" ]; then
+    if [ -t 0 ]; then
+        read -rsp "MaxMind license key for account $GEOIP_ACCOUNT_ID: " GEOIP_LICENSE_KEY
+        echo
+    else
+        warn "GEOIP_ACCOUNT_ID without GEOIP_LICENSE_KEY, and no terminal to ask for it: GeoIP not configured"
+        NOTES+=("Re-run install.sh with GEOIP_ACCOUNT_ID from a terminal, or with GEOIP_LICENSE_KEY too (README: GeoIP).")
+    fi
+fi
+GEO_FETCH=0
 if [ -n "${GEOIP_ACCOUNT_ID:-}" ] && [ -n "${GEOIP_LICENSE_KEY:-}" ]; then
+    command -v geoipupdate >/dev/null 2>&1 || maxmind_geoipupdate || true
     if command -v geoipupdate >/dev/null 2>&1; then
         # Debian's package ships placeholders (AccountID 0): not an account.
         if grep -qsE '^AccountID[[:space:]]+[1-9]' /etc/GeoIP.conf; then
-            echo "==> GeoIP: keeping the account already in /etc/GeoIP.conf (edit it to change account)"
-            grep -qsE '^EditionIDs.*GeoLite2-City' /etc/GeoIP.conf || warn "add GeoLite2-City to EditionIDs in /etc/GeoIP.conf"
+            # An account set up before (by install.sh or by hand): the one given now
+            # replaces it (a renewed license key, say); other settings and editions
+            # in the file stay, GeoLite2-City is added if missing.
+            echo "==> GeoIP: /etc/GeoIP.conf updated (MaxMind account, GeoLite2-City)"
+            python3 - "$GEOIP_ACCOUNT_ID" "$GEOIP_LICENSE_KEY" <<'PY'
+import re
+import sys
+
+p = "/etc/GeoIP.conf"
+s = open(p, encoding="utf-8").read()
+for key, value in (("AccountID", sys.argv[1]), ("LicenseKey", sys.argv[2])):
+    s, n = re.subn(rf"(?m)^{key}\s.*$", lambda m: f"{key} {value}", s)
+    s += "" if n else f"{key} {value}\n"
+if not re.search(r"(?m)^EditionIDs\s.*\bGeoLite2-City\b", s):
+    s, n = re.subn(r"(?m)^EditionIDs\s.*$", lambda m: m.group(0) + " GeoLite2-City", s)
+    s += "" if n else "EditionIDs GeoLite2-City\n"
+with open(p, "w", encoding="utf-8") as f:  # same file: owner kept
+    f.write(s)
+PY
+            chmod 600 /etc/GeoIP.conf
         else
             echo "==> GeoIP: /etc/GeoIP.conf (MaxMind account, GeoLite2-City)"
             # A new file: umask does not apply to an existing (0644) one, and the
@@ -327,11 +429,20 @@ if [ -n "${GEOIP_ACCOUNT_ID:-}" ] && [ -n "${GEOIP_LICENSE_KEY:-}" ]; then
             [ ! -f /etc/GeoIP.conf ] || mv /etc/GeoIP.conf /etc/GeoIP.conf.eduvpn-logger.bak
             (umask 077; printf 'AccountID %s\nLicenseKey %s\nEditionIDs GeoLite2-City\n' "$GEOIP_ACCOUNT_ID" "$GEOIP_LICENSE_KEY" >/etc/GeoIP.conf)
         fi
-        geoipupdate || warn "geoipupdate failed: check the MaxMind account ID and license key"
+        GEO_FETCH=1
     else
         warn "geoipupdate not available on this system: GeoIP not configured"
-        NOTES+=("Install geoipupdate (README: GeoIP), then re-run install.sh with the GEOIP_ variables.")
+        NOTES+=("Install geoipupdate (README: GeoIP), then re-run install.sh with GEOIP_ACCOUNT_ID.")
     fi
+fi
+# Download now (also for an account set up by hand that has no database yet), not
+# at the next weekly run.
+GEO_DIRS="/usr/local/share/GeoIP /usr/share/GeoIP /var/lib/GeoIP"
+geo_db() { for d in $GEO_DIRS; do [ ! -f "$d/GeoLite2-City.mmdb" ] || { echo "$d/GeoLite2-City.mmdb"; return; }; done; }
+if command -v geoipupdate >/dev/null 2>&1 && grep -qsE '^AccountID[[:space:]]+[1-9]' /etc/GeoIP.conf \
+    && { [ "$GEO_FETCH" = 1 ] || [ -z "$(geo_db)" ]; }; then
+    echo "==> GeoIP: downloading GeoLite2-City (geoipupdate)"
+    geoipupdate || warn "geoipupdate failed: check the MaxMind account ID and license key in /etc/GeoIP.conf"
 fi
 # The GeoLite license requires each new database to be in use within 30 days.
 # Debian and Ubuntu's geoipupdate brings a weekly timer; elsewhere (Fedora,
@@ -391,8 +502,8 @@ if [ -f "$PORTAL_CONF" ] && command -v php >/dev/null 2>&1; then
     DB_KIND=$(php -r '$c = require $argv[1]; echo strtok((is_array($c) && isset($c["Db"]["dbDsn"])) ? (string) $c["Db"]["dbDsn"] : "", ":");' \
         "$PORTAL_CONF" 2>/dev/null || true)
 fi
-DB_PATH=$(systemctl show -p Environment --value eduvpn-logger.service 2>/dev/null | tr ' ' '\n' \
-    | sed -n 's/^EDUVPN_PORTAL_DB=//p' | tail -n 1 || true)
+UNIT_ENV=$(systemctl show -p Environment --value eduvpn-logger.service 2>/dev/null || true)
+DB_PATH=$(tr ' ' '\n' <<<"$UNIT_ENV" | sed -n 's/^EDUVPN_PORTAL_DB=//p' | tail -n 1 || true)
 case $DB_KIND in
     "" | sqlite)
         row "portal DB" "$(python3 - "${DB_PATH:-/var/lib/vpn-user-portal/db.sqlite}" <<'PY' 2>/dev/null || echo "not readable"
@@ -405,19 +516,27 @@ PY
     *) row "portal DB" "$DB_KIND: not read (users come from the portal's events only, see README: Limitations)" ;;
 esac
 WG_IFS=$(wg show interfaces 2>/dev/null | tr -s ' ' ',' || true)
-row WireGuard "${WG_IFS:-no interface up (yet)}"
+case $WG_IFS in
+    "") WG_IFS="no interface up (yet)" ;;
+    *,*) [[ $UNIT_ENV == *EDUVPN_WG_INTERFACES=* ]] \
+        || WG_IFS="$WG_IFS (all eduVPN's? If not: EDUVPN_WG_INTERFACES, README: Configuration)" ;;
+esac
+row WireGuard "$WG_IFS"
 if [ -n "$PG_VHOST" ]; then
     row ProxyGuard "watcher $(systemctl is-active proxyguard-watcher.service || true), following $WATCH_LOG"
     [ -f "$WATCH_LOG" ] || NOTES+=("proxyguard-watcher follows $WATCH_LOG, which does not exist: point it at the ProxyGuard VirtualHost's ErrorLog (README: Manual setup).")
 else
     row ProxyGuard "not in use (no VirtualHost proxies it)"
 fi
-GEO=$(ls /usr/local/share/GeoIP/GeoLite2-City.mmdb /usr/share/GeoIP/GeoLite2-City.mmdb /var/lib/GeoIP/GeoLite2-City.mmdb 2>/dev/null | head -n 1 || true)
-if [ -z "$GEO" ]; then
-    row GeoIP "off (optional: GEOIP_ACCOUNT_ID=... GEOIP_LICENSE_KEY=... ./install.sh)"
+GEO=$(geo_db)
+if [ -z "$GEO" ] && grep -qsE '^AccountID[[:space:]]+[1-9]' /etc/GeoIP.conf; then
+    row GeoIP "off: no database downloaded yet"
+    NOTES+=("GeoIP: GeoLite2-City could not be downloaded: check the account and license key in /etc/GeoIP.conf and the server's access to MaxMind, then re-run install.sh (README: GeoIP).")
+elif [ -z "$GEO" ]; then
+    row GeoIP "off (optional: sudo GEOIP_ACCOUNT_ID=<MaxMind account> ./install.sh)"
 elif ! python3 -c 'import maxminddb' 2>/dev/null; then
     row GeoIP "off: python3-maxminddb missing ($GEO)"
-    NOTES+=("Install python3-maxminddb (Enterprise Linux: from EPEL), then: sudo systemctl restart eduvpn-logger.service")
+    NOTES+=("Install python3-maxminddb (Enterprise Linux: from EPEL): the logger starts using it within an hour.")
 else
     row GeoIP "on ($GEO)"
 fi

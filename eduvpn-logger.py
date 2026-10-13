@@ -31,6 +31,7 @@ import urllib.parse
 import sqlite3
 from collections import deque
 import dataclasses
+import importlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple
@@ -1677,22 +1678,29 @@ class GeoIp:
         self._reader = None
         self._path = ""
         self._mtime = 0.0
-        self._next_check = 0.0
+        self._open_database = None
         self._langs = [s.strip() for s in GEOIP_LANG.split(",") if s.strip()] or ["en"]
-        try:
-            import maxminddb  # type: ignore
-        except Exception:
-            if GEOIP_DB or any(os.path.exists(p) for p in GEOIP_DEFAULT_PATHS):
-                # GeoIP is wanted (path set, or a database installed): don't fail silently.
-                _log_err("geoip", RuntimeError("a GeoIP database is set up but the maxminddb module is not installed"))
-            return
-        self._open_database = maxminddb.open_database
+        self._find(warn=True)
+        self._next_check = time.time() + 3600.0
 
-        paths = (GEOIP_DB,) if GEOIP_DB else GEOIP_DEFAULT_PATHS
-        for p in paths:
+    def _find(self, warn: bool = False) -> None:
+        # The module and the database may come after the daemon started
+        # (python3-maxminddb installed later, geoipupdate's first run): looked for
+        # again hourly, no restart needed.
+        if self._open_database is None:
+            try:
+                importlib.invalidate_caches()
+                import maxminddb  # type: ignore
+            except Exception:
+                if warn and (GEOIP_DB or any(os.path.exists(p) for p in GEOIP_DEFAULT_PATHS)):
+                    # GeoIP is wanted (path set, or a database installed): don't fail silently.
+                    _log_err("geoip", RuntimeError("a GeoIP database is set up but the maxminddb module is not installed"))
+                return
+            self._open_database = maxminddb.open_database
+        for p in (GEOIP_DB,) if GEOIP_DB else GEOIP_DEFAULT_PATHS:
             if p and os.path.exists(p) and self._open(p):
                 return
-        if GEOIP_DB and self._reader is None:
+        if warn and GEOIP_DB:
             _log_err("geoip", FileNotFoundError(GEOIP_DB))
 
     def _open(self, path: str) -> bool:
@@ -1709,9 +1717,12 @@ class GeoIp:
         # geoipupdate replaces the file (weekly, typically) while the open reader
         # keeps serving the old data: reopen it when it changes, checked hourly.
         now = time.time()
-        if not self._path or now < self._next_check:
+        if now < self._next_check:
             return
         self._next_check = now + 3600.0
+        if not self._path:
+            self._find()
+            return
         try:
             changed = os.stat(self._path).st_mtime != self._mtime
         except OSError:
