@@ -97,8 +97,11 @@ and cannot see past ProxyGuard, whose traffic reaches WireGuard from
   in time. Each tunnel is attributed once, and the `tcp_candidates` field says
   how many tunnels were possible, so an ambiguous match is visible as such.
 - **Identity from the source of truth.** User and profile come from the
-  portal's own CONNECT events; the portal database, read-only and with its
-  schema detected at runtime, fills in when an event is missing.
+  portal: its database row for the session's public key (read-only, schema
+  detected at runtime), or else its CONNECT event. The portal writes user IDs
+  into its log lines as they are, so a line where a user ID mimics the template
+  (to pass for another user, or for another session's key) is set aside, never
+  misread.
 - **Restarts are seamless.** The journal position is saved after every portal
   event, and the open sessions when the service stops: after an upgrade or a
   reboot, events logged meanwhile are processed first, with their original
@@ -176,8 +179,9 @@ state read at every poll:
   stamped 180 s after the last handshake. When traffic resumes on the same key,
   a new session of the same user starts.
 
-User, profile and tunnel addresses come from the portal's CONNECT event, or
-else from the portal database by public key; `-` if neither knows the key. A
+User and profile come from the portal database by public key, or else from the
+portal's CONNECT event; tunnel addresses from the event, or else the database;
+`-` if neither knows the key. A
 session announced by the portal stays open until its DISCONNECT, however long
 it takes to handshake: a configuration downloaded from the portal and first
 used days later gets its source in a `roam` line.
@@ -237,9 +241,10 @@ many starts were in the window: `1` means there was no other candidate.
 `/var/lib/eduvpn-logger` keeps the journal position and, while the service is
 stopped, the open sessions (`sessions.json`, readable by root only). On start
 the sessions are restored and the file removed, the portal events logged
-meanwhile are processed, and only then is WireGuard read: a session the portal
-closed meanwhile gets the portal's disconnect, one that went silent gets an
-inferred one, a live one goes on (a ProxyGuard session keeps its real address).
+meanwhile are processed, as are the starts of the ProxyGuard tunnels opened
+meanwhile, and only then is WireGuard read: a session the portal closed
+meanwhile gets the portal's disconnect, one that went silent gets an inferred
+one, a live one goes on (a ProxyGuard session keeps its real address).
 Everything else is in memory and bounded by the live sessions: it is reconciled
 with `wg show` at every poll, and the work per poll grows linearly with the
 number of peers. After a crash there is no saved state: sessions still active
@@ -353,7 +358,7 @@ few seconds of the tunnel coming up. Warnings from the daemon are in
 | `inferred=1` on every connect and disconnect | the portal's connection log is off: re-run `install.sh` |
 | `user=-` on connect lines | portal DB not found or not readable: check `EDUVPN_PORTAL_DB`; a PostgreSQL or MariaDB portal DB (see [Limitations](#limitations)); or peers of a non-eduVPN WireGuard interface: set `EDUVPN_WG_INTERFACES` |
 | `transport=tcp src_ip="-"`, or the warning `ProxyGuard (TCP) session but no tunnel start read` | Apache not tracing ProxyGuard's requests, or the watcher reading the wrong `ErrorLog` (or a custom `ErrorLogFormat` without `[client %a] %M`): re-run `install.sh` (also after changing the VirtualHost), then see `systemctl cat proxyguard-watcher` and the `tail` of `proxyguard_start.log` |
-| warning `ignoring unparsable/non-WireGuard event` | custom log template without `CONN=`, or an OpenVPN event (ignored by design) |
+| warning `ignoring unparsable/non-WireGuard event` | custom log template without `CONN=`, an OpenVPN event (ignored by design), or a line where a user ID mimics the template (set aside: the session is followed from WireGuard, the user from the portal database) |
 | warning `untrusted _UID=…` | a portal event logged by a non-system account was rejected (see [Limitations](#limitations)) |
 
 ### Manual setup
@@ -611,7 +616,9 @@ zgrep -h ' event=connect .*country=' /var/log/eduvpn/eduvpn.log* | grep -v 'coun
 - **Portal database on PostgreSQL or MariaDB**: it is not read, so a session
   with no portal event at all (after a crash, or a non-eduVPN peer) gets
   `user=-`. Sessions announced by the portal, and new sessions on their keys,
-  are unaffected.
+  are unaffected. Users then come from the portal's log lines alone, where a
+  user ID is written as it is: one containing a space followed by capital
+  letters and `=` (`alice X=1`) is cut there (`alice`).
 - **Sampling.** WireGuard is read every `EDUVPN_WG_POLL_SEC`: a roam and back
   within one interval is not seen, and a session shorter than one interval has
   no source address (its connect and disconnect still come from the portal).
@@ -653,7 +660,10 @@ cd eduvpn-logger && git pull && sudo ./install.sh
 
 Settings that an older version had you edit directly into the unit files
 (`Environment=` lines, the watcher's `ErrorLog` path) are moved to
-`<unit>.d/00-migrated.conf` before the units are replaced.
+`<unit>.d/00-migrated.conf` before the units are replaced. A version from
+before 12 October 2026 saves no sessions when it stops: upgrading from it, the
+sessions open at that moment are announced again once (`inferred=1`), as after
+a crash.
 
 Removal:
 

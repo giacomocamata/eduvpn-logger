@@ -110,8 +110,13 @@ def _log_err(context: str, exc: BaseException) -> None:
 def _syslog_facility_const() -> int:
     if _syslog is None:
         return 0
-    name = "LOG_" + SYSLOG_FACILITY.strip().upper()
-    return getattr(_syslog, name, _syslog.LOG_LOCAL0)
+    fac = getattr(_syslog, "LOG_" + SYSLOG_FACILITY.strip().upper(), None)
+    # A facility is a non-zero multiple of 8 ("info" or a typo would silently
+    # send the events somewhere the SIEM does not look).
+    if isinstance(fac, int) and fac > 0 and fac % 8 == 0:
+        return fac
+    _log_err("config", ValueError(f"EDUVPN_SYSLOG_FACILITY={SYSLOG_FACILITY!r} is not a syslog facility; using local0"))
+    return _syslog.LOG_LOCAL0
 
 
 def _parse_journal_realtime_ts(entry: dict) -> Optional[float]:
@@ -138,6 +143,15 @@ def _is_global_ip(ip: str) -> bool:
         return ipaddress.ip_address(ip).is_global
     except Exception:
         return False
+
+
+def _is_ip(value: str) -> bool:
+    # A bare address: no zone ("%..." would let any text through ip_address()).
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return "%" not in value
 
 
 def _is_loopback(ip: Optional[str]) -> bool:
@@ -184,9 +198,12 @@ _WG_PUBKEY_RE = re.compile(r"^[A-Za-z0-9+/]{43}=$")
 # vpn-user-portal's *default* templates (no connectLogTemplate configured):
 #   CONNECT user (profile:conn) [orig_ip => ip4,ip6]   (older: [ip4,ip6])
 #   DISCONNECT user (profile:conn)
+# Greedy user: the session's own group is the last one with a key.
 _PORTAL_DEFAULT_RE = re.compile(
-    r"^(CONNECT|DISCONNECT) (.+?) \(([^:()\s]+):([A-Za-z0-9+/]{43}=)\)(?: \[(?:[^\]]*=> )?([^,\]\s]*),([^\]\s]*)\])?"
+    r"^(CONNECT|DISCONNECT) (.+) \(([^:()\s]+):([A-Za-z0-9+/]{43}=)\)(?: \[(?:[^\]]*=> )?([^,\]\s]*),([^\]\s]*)\])?"
 )
+# A "(profile:connection)" group of the default format.
+_PORTAL_GROUP_RE = re.compile(r"\([^:()\s]+:[^()\s]*\)")
 
 
 def _parse_portal_event(message: str) -> Optional[Tuple[str, Dict[str, str]]]:
@@ -201,10 +218,23 @@ def _parse_portal_event(message: str) -> Optional[Tuple[str, Dict[str, str]]]:
         kind = "DISCONNECT"
     else:
         return None
-    kv = {k: v for k, v in _portal_kv(message[len(kind) + 1 :]).items() if v}
-    if "CONN" not in kv:
+    # The portal inserts the user ID raw, before the session's own fields: what it
+    # holds must not pass for them (another user's ID, another session's key). A
+    # repeated key, or a "(profile:id)" group after CONN= or after the default
+    # format's group (the user ID held " CONN=..." or "(profile:key)"), makes the
+    # line ambiguous: dropped.
+    text = message[len(kind) + 1 :]
+    keys = list(_PORTAL_KEY_RE.finditer(text))
+    if len({m.group(1) for m in keys}) != len(keys):
+        return None
+    conn = next((m for m in keys if m.group(1) == "CONN"), None)
+    kv = {k: v for k, v in _portal_kv(text).items() if v}
+    if conn is not None:
+        if _PORTAL_GROUP_RE.search(text, conn.end()):
+            return None
+    else:
         m = _PORTAL_DEFAULT_RE.match(message)
-        if m is None:
+        if m is None or _PORTAL_GROUP_RE.search(message, m.end(4)):
             return None
         kv = {"USER": m.group(2), "PROFILE": m.group(3), "CONN": m.group(4)}
         if m.group(5):
@@ -595,6 +625,10 @@ class Correlator:
         self._closed_while_polling: set[str] = set()
         self._warned_portal_format = False
         self._wg_warned = False
+        self._write_warned = False
+        # When the sessions were saved (load_state): ProxyGuard starts written
+        # since then are read at start.
+        self.stopped_at = 0.0
         self._started = time.time()
         self._last_tcp_start = 0.0  # time.time() of the last ProxyGuard start read
         self._tcp_warned = False
@@ -652,9 +686,13 @@ class Correlator:
                 with open(self._out_path, "a", encoding="utf-8") as f:
                     f.write(line + "\n")
                     f.flush()
+                self._write_warned = False
             except OSError as e:
                 # Disk full / permissions: still deliver the event to syslog below.
-                _log_err("write log file", e)
+                # Said once per outage, not for every line.
+                if not self._write_warned:
+                    self._write_warned = True
+                    _log_err("write log file", e)
             if _syslog is not None:
                 try:
                     # Syslog stamps the time the line is written, which can be later
@@ -820,6 +858,7 @@ class Correlator:
                 [wg, "show", "all", "dump"],
                 capture_output=True,
                 text=True,
+                errors="replace",  # an interface name that is not UTF-8 must not stop the poller
                 timeout=5.0,
             )
         except Exception:
@@ -838,6 +877,7 @@ class Correlator:
                     [wg, "show", "all", "transfer"],
                     capture_output=True,
                     text=True,
+                    errors="replace",
                     timeout=5.0,
                 )
             except Exception:
@@ -1038,9 +1078,9 @@ class Correlator:
             if silent_for < SYNTH_DISCONNECT_AFTER_SEC:
                 continue
             endpoint = self._virtual_peers.pop(pubkey, "")
-            if self._virtual_due.pop(pubkey, None) is not None:
+            if self._virtual_due.pop(pubkey, None) is not None and pubkey not in self._emitted_connect_ts:
                 # Connect was never emitted (peer vanished during the grace window):
-                # nothing to disconnect.
+                # nothing to disconnect. (One the portal announced meanwhile was.)
                 continue
             # Stamped when the session ended at the latest (threshold after its last
             # handshake), not when that is noticed: later after failed `wg show`
@@ -1333,8 +1373,9 @@ class Correlator:
         if parsed is None:
             if (message.startswith(("CONNECT ", "DISCONNECT ")) and "PROTO=openvpn" not in message
                     and not self._warned_portal_format):
-                # One warning, not one per event: most likely an OpenVPN session or a
-                # custom connectLogTemplate without CONN= (see README).
+                # One warning, not one per event: most likely an OpenVPN session, a
+                # custom connectLogTemplate without CONN= (see README), or a user ID
+                # that mimics the template (ambiguous line).
                 self._warned_portal_format = True
                 _log_err("portal", ValueError(f"ignoring unparsable/non-WireGuard event: {message[:120]!r}"))
             return
@@ -1350,6 +1391,10 @@ class Correlator:
             db = self._db.lookup(conn)
             if db is not None:
                 device = _device_from_client_marker(db.client_id, db.display_name)
+                # The key's DB row over the log text, where the user ID is written
+                # raw: one holding " KEY=..." would be read as a shorter one.
+                user = db.user if db.user != "-" else user
+                profile = db.profile if db.profile != "-" else profile
             ev = ConnectEvent(ts=ts, user=user, profile=profile, device=device, conn=conn, ip4=ip4, ip6=ip6, from_portal=True)
             self._conn_info[conn] = ev
 
@@ -1387,7 +1432,11 @@ class Correlator:
             # in the log already, don't write it twice.
             echo = (self._silence_closed.pop(conn, None) is not None
                     and conn not in self._emitted_connect_ts and conn not in self._pending_connect)
-            self._session_info(conn, ts)  # the device, for the disconnect line
+            info = self._session_info(conn, ts)
+            if info is not None:
+                # Who the session is (and its device), not the log text: see CONNECT.
+                user = info.user if info.user != "-" else user
+                profile = info.profile if info.profile != "-" else profile
             pending = self._pending_connect.pop(conn, None)
             if pending is not None and conn not in self._emitted_connect_ts:
                 # The portal announced it but it never resolved (e.g. no handshake):
@@ -1444,6 +1493,7 @@ class Correlator:
                 "pending": {k: [ts, asdict(ev)] for k, (ts, ev) in self._pending_connect.items()},
                 "silence_closed": {k: asdict(who) for k, (_seen, who) in self._silence_closed.items()},
                 "tcp_starts": [[e.ts, e.src_ip, e.src_port] for e in self._tcp_start_queue],
+                "stopped": time.time(),  # the starts read so far: the ones after come at start
             }
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         tmp = path + ".tmp"
@@ -1462,6 +1512,19 @@ class Correlator:
         maps = (self._emitted_connect_ts, self._conn_info, self._pubkey_src, self._virtual_peers,
                 self._peer_last_handshake, self._wg_bytes_baseline, self._wg_bytes_last, self._roam_last,
                 self._roam_owed, self._tcp_candidates, self._pending_connect, self._silence_closed)
+        # Every value converted to its type: a malformed file is rejected here, whole,
+        # instead of breaking every poll after it.
+        def event(d: dict) -> ConnectEvent:
+            return ConnectEvent(ts=float(d["ts"]), user=str(d["user"]), profile=str(d["profile"]),
+                                device=str(d["device"]), conn=str(d["conn"]), ip4=str(d["ip4"]),
+                                ip6=str(d["ip6"]), from_portal=bool(d["from_portal"]))
+
+        def src(v: list) -> Tuple[float, str, str, str]:
+            return float(v[0]), str(v[1]), str(v[2]), str(v[3])
+
+        def pair(v: list) -> Tuple[int, int]:
+            return int(v[0]), int(v[1])
+
         try:
             data = json.loads(raw)
             if data.get("version") != 1:
@@ -1469,25 +1532,27 @@ class Correlator:
             for k, s in data["sessions"].items():
                 self._emitted_connect_ts[k] = now
                 if s["info"]:
-                    self._conn_info[k] = ConnectEvent(**s["info"])
-                for d, v, conv in ((self._pubkey_src, s["src"], tuple), (self._virtual_peers, s["endpoint"], str),
-                                   (self._peer_last_handshake, s["last_hs"], int), (self._wg_bytes_baseline, s["base"], tuple),
-                                   (self._wg_bytes_last, s["bytes"], tuple), (self._roam_last, s["roam_last"], float),
-                                   (self._roam_owed, s["owed"], tuple), (self._tcp_candidates, s["tcp_candidates"], int)):
+                    self._conn_info[k] = event(s["info"])
+                for d, v, conv in ((self._pubkey_src, s["src"], src), (self._virtual_peers, s["endpoint"], str),
+                                   (self._peer_last_handshake, s["last_hs"], int), (self._wg_bytes_baseline, s["base"], pair),
+                                   (self._wg_bytes_last, s["bytes"], pair), (self._roam_last, s["roam_last"], float),
+                                   (self._roam_owed, s["owed"], src), (self._tcp_candidates, s["tcp_candidates"], int)):
                     if v is not None:
                         d[k] = conv(v)
             for k, (ts, ev) in data["pending"].items():
-                self._pending_connect[k] = (float(ts), ConnectEvent(**ev))
+                self._pending_connect[k] = (float(ts), event(ev))
                 self._conn_info.setdefault(k, self._pending_connect[k][1])
             for k, who in data["silence_closed"].items():
                 # From now: its late portal DISCONNECT is still an echo.
-                self._silence_closed[k] = (now, ConnectEvent(**who) if who else None)
+                self._silence_closed[k] = (now, event(who) if who else None)
             for ts, ip, port in data["tcp_starts"]:
                 self._tcp_start_queue.append(TcpStartEvent(ts=float(ts), src_ip=str(ip), src_port=str(port)))
+            self.stopped_at = float(data.get("stopped", 0.0))  # 0: saved by a release without it
         except Exception as e:
             for d in maps:
                 d.clear()
             self._tcp_start_queue.clear()
+            self.stopped_at = 0.0
             _log_err("session state", ValueError(f"{path} unusable ({e!r}): live sessions are announced again"))
 
 
@@ -1591,6 +1656,13 @@ def _reader_journal(q: "queue.Queue[Tuple[str, float, Optional[str], Optional[st
                 if ts is None:
                     ts = time.time()
                 msg = entry.get("MESSAGE")
+                if isinstance(msg, list):
+                    # journalctl's JSON gives a value that is not printable UTF-8 (a
+                    # control character in a user ID) as its bytes: still an event.
+                    try:
+                        msg = bytes(msg).decode("utf-8", "replace")
+                    except (TypeError, ValueError):
+                        msg = None
                 if not isinstance(msg, str) or not msg:
                     msg = None
                 elif not _trusted_portal_entry(entry, uid_max):
@@ -1634,7 +1706,30 @@ def _reader_journal(q: "queue.Queue[Tuple[str, float, Optional[str], Optional[st
     # Stopping: no new journalctl (systemd would wait for it).
 
 
-def _reader_proxyguard_start(q: "queue.Queue[Tuple[str, float, Optional[str], Optional[str]]]") -> None:
+def _proxyguard_backlog(after: float) -> list:
+    # The starts written since `after` (the daemon's stop) that a tunnel can still
+    # be matched to, i.e. of the last 2 minutes: the last 64 KB of the file hold
+    # them, unless a flood of starts makes it moot.
+    try:
+        with open(PROXYGUARD_START_LOG, "rb") as f:
+            at = max(0, f.seek(0, os.SEEK_END) - 65536)
+            f.seek(at)
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    since = max(after, time.time() - 120.0)
+    starts = [_parse_proxyguard_start_line(line.strip()) for line in lines[1 if at else 0 :]]  # [0] may be cut
+    return [s for s in starts if s is not None and s[0] > since]
+
+
+def _reader_proxyguard_start(q: "queue.Queue[Tuple[str, float, Optional[str], Optional[str]]]", after: float = 0.0) -> None:
+    # Tunnels opened while the daemon was stopped (restart, upgrade, reboot) have
+    # their start read first, or each would get no source, or another's.
+    try:
+        for ts, src_ip, src_port in _proxyguard_backlog(after) if after else ():
+            q.put(("proxyguard_start", ts, f"{src_ip} {src_port}", None))
+    except Exception as e:  # never the end of this thread: the starts after still count
+        _log_err("proxyguard reader", e)
     cmd = ["tail", "-n", "0", "-F", PROXYGUARD_START_LOG]
     while not _STOP.is_set():
         p = None
@@ -1767,10 +1862,11 @@ def _parse_proxyguard_start_line(line: str) -> Optional[Tuple[float, str, str]]:
     kv = _split_kv(" ".join(parts[1:]))
     if kv.get("event") != "start":
         return None
-    src_ip = kv.get("src_ip")
-    if not src_ip:
-        return None
+    # Copied into the log lines: an address and a port number, nothing else.
+    src_ip = kv.get("src_ip", "")
     src_port = kv.get("src_port", "-")
+    if not _is_ip(src_ip) or not (src_port == "-" or re.fullmatch(r"[0-9]{1,5}", src_port)):
+        return None
     try:
         ts = datetime.fromisoformat(ts_raw).timestamp()
     except Exception:
@@ -1803,6 +1899,10 @@ def _split_endpoint(endpoint: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def main() -> None:
+    # First: a stop from now on saves the sessions, also one while they are loaded
+    # (load_state removes the file).
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: _STOP.set())
     q: "queue.Queue[Tuple[str, float, Optional[str], Optional[str]]]" = queue.Queue()
     corr = Correlator()
     if _DISCONNECT_AFTER_ENV < SYNTH_DISCONNECT_AFTER_SEC:
@@ -1811,13 +1911,11 @@ def main() -> None:
             f"lifetime and would cut live sessions; using {SYNTH_DISCONNECT_AFTER_SEC:g}"))
 
     corr.load_state(SESSIONS_PATH)
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: _STOP.set())
 
     # WireGuard connect/roam/disconnect events are synthesized internally by the
     # wg poller (_synthesize_wg_events) — no external WireGuard logger required.
     t_portal = threading.Thread(target=_reader_journal, args=(q,), daemon=True)
-    t_pg = threading.Thread(target=_reader_proxyguard_start, args=(q,), daemon=True)
+    t_pg = threading.Thread(target=_reader_proxyguard_start, args=(q, corr.stopped_at), daemon=True)
     t_poll = threading.Thread(target=_wg_poller, args=(corr,), daemon=True)
 
     t_portal.start()

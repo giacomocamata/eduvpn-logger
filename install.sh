@@ -235,7 +235,7 @@ portal_log_state() {
         $dt = (string) ($l["disconnectLogTemplate"] ?? "");
         $f = ($ct === "" && $dt === "") ? "default"
             : ((strpos($ct, "CONNECT ") === 0 && strpos($dt, "DISCONNECT ") === 0
-                && strpos($ct, "{{CONNECTION_ID}}") !== false && strpos($dt, "{{CONNECTION_ID}}") !== false) ? "kv" : "custom");
+                && strpos($ct, " CONN={{CONNECTION_ID}}") !== false && strpos($dt, " CONN={{CONNECTION_ID}}") !== false) ? "kv" : "custom");
         echo empty($l["syslogConnectionEvents"]) ? "off" : "on", " ", $f, "\n";
     ' "$1" 2>/dev/null || true
 }
@@ -406,6 +406,7 @@ if [ -n "${GEOIP_ACCOUNT_ID:-}" ] && [ -n "${GEOIP_LICENSE_KEY:-}" ]; then
             # replaces it (a renewed license key, say); other settings and editions
             # in the file stay, GeoLite2-City is added if missing.
             echo "==> GeoIP: /etc/GeoIP.conf updated (MaxMind account, GeoLite2-City)"
+            chmod 600 /etc/GeoIP.conf  # before the new key is in it
             python3 - "$GEOIP_ACCOUNT_ID" "$GEOIP_LICENSE_KEY" <<'PY'
 import re
 import sys
@@ -421,7 +422,6 @@ if not re.search(r"(?m)^EditionIDs\s.*\bGeoLite2-City\b", s):
 with open(p, "w", encoding="utf-8") as f:  # same file: owner kept
     f.write(s)
 PY
-            chmod 600 /etc/GeoIP.conf
         else
             echo "==> GeoIP: /etc/GeoIP.conf (MaxMind account, GeoLite2-City)"
             # A new file: umask does not apply to an existing (0644) one, and the

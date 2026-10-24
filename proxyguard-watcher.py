@@ -10,6 +10,7 @@ ends, which for a long-lived tunnel can be days later.
 
 Output path is overridable via EDUVPN_PROXYGUARD_START_LOG.
 """
+import ipaddress
 import os
 import sys
 from datetime import datetime, timezone
@@ -36,9 +37,13 @@ def parse_line(line: str) -> Optional[Tuple[str, str]]:
     if end < 0 or not line.startswith(MATCH, end + 2):
         return None
     ip, sep, port = line[start + 8 : end].rpartition(":")
-    if not sep or not ip or not port.isdigit():
+    if not sep or not ip or not (port.isascii() and port.isdigit()):
         return None  # no port (rare; some Apache configs)
-    return ip, port
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return None  # not an address: not Apache's own tag
+    return (ip, port) if "%" not in ip else None  # a zone would let any text through
 
 
 def main() -> None:

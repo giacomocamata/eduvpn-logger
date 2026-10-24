@@ -100,10 +100,13 @@ reale.
   all'handshake WireGuard. Ogni tunnel viene attribuito una sola volta, e il
   campo `tcp_candidates` dice quanti tunnel erano possibili, così un
   abbinamento ambiguo si riconosce come tale.
-- **L'identità dalla fonte autorevole.** Utente e profilo arrivano dagli
-  eventi CONNECT del portale stesso; il database del portale, aperto in sola
-  lettura e con lo schema riconosciuto a runtime, supplisce quando un evento
-  manca.
+- **L'identità dalla fonte autorevole.** Utente e profilo arrivano dal
+  portale: dalla riga del suo database per la public key della sessione
+  (aperto in sola lettura, con lo schema riconosciuto a runtime), altrimenti
+  dal suo evento CONNECT. Il portale scrive gli identificativi utente nelle
+  righe di log così come sono, quindi una riga in cui un identificativo imita
+  il template (per farsi passare per un altro utente, o per la chiave di
+  un'altra sessione) viene scartata, mai letta male.
 - **Riavvii senza strappi.** La posizione nel journal viene salvata dopo ogni
   evento del portale, e le sessioni aperte quando il servizio si ferma: dopo
   un aggiornamento o un riavvio del server gli eventi registrati nel frattempo
@@ -184,9 +187,9 @@ dallo stato dei peer letto a ogni interrogazione:
   traffico riprende sulla stessa chiave, si apre una nuova sessione dello
   stesso utente.
 
-Utente, profilo e indirizzi del tunnel vengono dall'evento CONNECT del
-portale, oppure dal database del portale tramite la public key; `-` se nessuno
-dei due la conosce. Una sessione annunciata dal portale resta aperta fino al
+Utente e profilo vengono dal database del portale tramite la public key,
+oppure dall'evento CONNECT del portale; gli indirizzi del tunnel dall'evento,
+oppure dal database; `-` se nessuno dei due la conosce. Una sessione annunciata dal portale resta aperta fino al
 suo DISCONNECT, per quanto tardi arrivi l'handshake: una configurazione
 scaricata dal portale e usata per la prima volta giorni dopo riceve la
 provenienza in una riga `roam`.
@@ -247,8 +250,9 @@ aperture c'erano nella finestra: `1` significa che non c'erano altri candidati.
 `/var/lib/eduvpn-logger` conserva la posizione nel journal e, mentre il
 servizio è fermo, le sessioni aperte (`sessions.json`, leggibile solo da
 root). All'avvio le sessioni vengono ripristinate e il file rimosso, si
-elaborano gli eventi del portale registrati nel frattempo, e solo dopo si legge
-WireGuard: una sessione chiusa dal portale nel frattempo riceve il disconnect
+elaborano gli eventi del portale registrati nel frattempo, e così le aperture
+dei tunnel ProxyGuard avvenute nel frattempo, e solo dopo si legge WireGuard:
+una sessione chiusa dal portale nel frattempo riceve il disconnect
 del portale, una rimasta in silenzio quello dedotto, una attiva prosegue (una
 sessione ProxyGuard conserva il suo indirizzo reale). Tutto il resto è in
 memoria e limitato alle sessioni attive: a ogni lettura viene riallineato con
@@ -367,7 +371,7 @@ con l'utente e l'IP pubblico di provenienza. Gli avvisi del daemon sono in
 | `inferred=1` su tutti i connect e disconnect | log delle connessioni del portale spento: riesegui `install.sh` |
 | `user=-` nelle righe connect | database del portale non trovato o non leggibile: controlla `EDUVPN_PORTAL_DB`; database del portale PostgreSQL o MariaDB (vedi [Limiti](#limiti)); oppure peer di un'interfaccia WireGuard non eduVPN: imposta `EDUVPN_WG_INTERFACES` |
 | `transport=tcp src_ip="-"`, o l'avviso `ProxyGuard (TCP) session but no tunnel start read` | Apache non traccia le richieste di ProxyGuard, o il watcher legge l'`ErrorLog` sbagliato (o un `ErrorLogFormat` personalizzato senza `[client %a] %M`): riesegui `install.sh` (anche dopo aver cambiato il VirtualHost), poi guarda `systemctl cat proxyguard-watcher` e la coda di `proxyguard_start.log` |
-| avviso `ignoring unparsable/non-WireGuard event` | template personalizzato senza `CONN=`, o evento OpenVPN (ignorato di proposito) |
+| avviso `ignoring unparsable/non-WireGuard event` | template personalizzato senza `CONN=`, evento OpenVPN (ignorato di proposito), o una riga in cui un identificativo utente imita il template (scartata: la sessione viene seguita da WireGuard, l'utente dal database del portale) |
 | avviso `untrusted _UID=…` | scartato un evento del portale registrato da un account non di sistema (vedi [Limiti](#limiti)) |
 
 ### Configurazione manuale
@@ -629,7 +633,10 @@ zgrep -h ' event=connect .*country=' /var/log/eduvpn/eduvpn.log* | grep -v 'coun
 - **Database del portale su PostgreSQL o MariaDB**: non viene letto, quindi una
   sessione senza alcun evento del portale (dopo un crash, o un peer non eduVPN)
   ha `user=-`. Le sessioni annunciate dal portale, e le nuove sessioni sulle
-  loro chiavi, non ne risentono.
+  loro chiavi, non ne risentono. Gli utenti vengono allora solo dalle righe di
+  log del portale, dove l'identificativo è scritto così com'è: uno che
+  contiene uno spazio seguito da maiuscole e `=` (`alice X=1`) viene troncato
+  lì (`alice`).
 - **Campionamento.** WireGuard viene letto ogni `EDUVPN_WG_POLL_SEC`: un roam
   con ritorno dentro lo stesso intervallo non viene visto, e una sessione più
   breve di un intervallo resta senza indirizzo di provenienza (connect e
@@ -676,6 +683,9 @@ cd eduvpn-logger && git pull && sudo ./install.sh
 Le impostazioni che una versione precedente faceva modificare direttamente nei
 file delle unit (righe `Environment=`, percorso dell'`ErrorLog` del watcher)
 vengono spostate in `<unit>.d/00-migrated.conf` prima di sostituire le unit.
+Una versione precedente al 12 ottobre 2026 non salva le sessioni quando si
+ferma: aggiornando da quella, le sessioni aperte in quel momento vengono
+annunciate di nuovo una volta (`inferred=1`), come dopo un crash.
 
 Rimozione:
 
