@@ -65,6 +65,7 @@ keys shortened).*
 - [Upgrade and removal](#upgrade-and-removal)
 - [FAQ](#faq)
 - [Related projects](#related-projects)
+- [Acknowledgements](#acknowledgements)
 - [License](#license)
 
 ## The problem
@@ -715,6 +716,15 @@ the same host.
   follows this log and sends every session's user and tunnel address to a
   FortiGate as RADIUS Accounting (RSSO), for identity-based firewall policies
   and per-user firewall logs.
+
+## Acknowledgements
+
+eduvpn-logger grew out of a first version built on
+[wglogger](https://codeberg.org/flaruina/wglogger) by Francesco Laruina
+(INFN), which showed how to turn WireGuard's state into connect, roam and
+disconnect events by mapping each endpoint to its peer's public key. Reading
+that same mapping straight from `wg show` is what made this daemon
+self-contained.
 
 ## License
 

@@ -66,6 +66,7 @@ sospensione (public key abbreviate).*
 - [Aggiornamento e rimozione](#aggiornamento-e-rimozione)
 - [Domande frequenti](#domande-frequenti)
 - [Progetti collegati](#progetti-collegati)
+- [Riconoscimenti](#riconoscimenti)
 - [Licenza](#licenza)
 
 ## Il problema
@@ -739,6 +740,15 @@ stessa macchina.
   segue questo log e invia a un FortiGate l'utente e l'indirizzo del tunnel di
   ogni sessione come RADIUS Accounting (RSSO), per policy firewall basate
   sull'identità e log del firewall per utente.
+
+## Riconoscimenti
+
+eduvpn-logger nasce da una prima versione costruita su
+[wglogger](https://codeberg.org/flaruina/wglogger) di Francesco Laruina
+(INFN), che ha mostrato come ricavare dallo stato di WireGuard gli eventi di
+connect, roam e disconnect associando ogni endpoint alla public key del suo
+peer. Leggere la stessa associazione direttamente da `wg show` è ciò che ha
+reso questo daemon autosufficiente.
 
 ## Licenza
 
