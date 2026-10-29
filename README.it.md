@@ -65,6 +65,7 @@ sospensione (public key abbreviate).*
 - [Limiti](#limiti)
 - [Sicurezza e privacy](#sicurezza-e-privacy)
 - [Aggiornamento e rimozione](#aggiornamento-e-rimozione)
+- [ProxyGuard con TLS proprio (in arrivo)](#proxyguard-con-tls-proprio-in-arrivo)
 - [Domande frequenti](#domande-frequenti)
 - [Progetti collegati](#progetti-collegati)
 - [Riconoscimenti](#riconoscimenti)
@@ -714,7 +715,9 @@ zgrep -h ' event=connect .*country=' /var/log/eduvpn/eduvpn.log* | grep -v 'coun
   rimasta può essere di un altro client). Gli IP di provenienza UDP arrivano dal
   kernel e sono esatti. Più istanze di proxyguard-server sulla stessa macchina
   devono essere unit chiamate `proxyguard-server*.service`; una su un'altra
-  macchina (un proxy dedicato) non viene seguita.
+  macchina (un proxy dedicato) non viene seguita: le sue sessioni risultano UDP
+  dall'indirizzo del proxy (vedi
+  [ProxyGuard con TLS proprio](#proxyguard-con-tls-proprio-in-arrivo)).
 - **Il formato dell'error log di Apache vale per tutto il server** (ProxyGuard
   2.1.1 o successivo). È quello di default di Apache più `[pgport N]` nelle sole
   righe di trace, che hanno solo le aperture dei tunnel ProxyGuard, quindi gli
@@ -828,6 +831,115 @@ di conservazione), il log delle connessioni del portale (se l'aveva attivato
 `install.sh`, il `config.php` precedente è in `config.php.eduvpn-logger.bak`),
 `/etc/GeoIP.conf` e i pacchetti. Resta anche un blocco di tracciamento
 aggiunto a mano al VirtualHost.
+
+## ProxyGuard con TLS proprio (in arrivo)
+
+Il codice in sviluppo di ProxyGuard (commit `ac8576c` del 23 ottobre 2026, in
+nessuna release per ora: l'ultima è la 2.1.1) permette a proxyguard-server di
+ricevere da solo le connessioni delle app, con un proprio certificato, invece
+che dietro Apache:
+
+```
+oggi:      app ──HTTPS──▶ Apache ──HTTP──▶ proxyguard-server (127.0.0.1)      ──UDP──▶ WireGuard
+in arrivo: app ──TLS─────────────────────▶ proxyguard-server (porta pubblica) ──UDP──▶ WireGuard
+```
+
+Si attiva nella unit di proxyguard-server: certificato e chiave come credenziali
+systemd (`LoadCredential=fullchain.pem:…` e `LoadCredential=privkey.pem:…`), un
+`LISTEN` pubblico (l'esempio è `:443`) e `CAP_NET_BIND_SERVICE`; solo TLS 1.3 e
+HTTP/1.x. Questi nomi vengono dal codice in sviluppo: verificali sulle note della
+release quando uscirà.
+
+eduvpn-logger trova l'indirizzo di un client ProxyGuard nel log di Apache,
+quindi non segue ancora una configurazione così. Cosa succede, e cosa cambiare:
+
+| Configurazione | WireGuard vede | eduvpn-logger oggi | Per supportarla |
+|---|---|---|---|
+| Apache davanti a proxyguard-server, stessa macchina | `127.0.0.1` | esatto da ProxyGuard 2.1.1, nel tempo prima | nulla |
+| proxyguard-server con TLS proprio, stessa macchina (su una porta o un indirizzo diversi da quelli di Apache) | `127.0.0.1` | `transport=tcp src_ip="-"`, dopo 10 min l'avviso `ProxyGuard (TCP) session but no tunnel start read`; `install.sh` indica ProxyGuard come `not in use` | punti 1 e 2 qui sotto |
+| proxyguard-server, con o senza Apache, su un'altra macchina (un proxy dedicato) | l'indirizzo del proxy | `transport=udp` con indirizzo e posizione **del proxy**: fuorviante | punto 3 qui sotto |
+| più nodi, proxyguard-server su ognuno | `127.0.0.1`, sul nodo | non supportato: il portale gira su un'altra macchina ([Requisiti](#requisiti)) | — |
+
+### 1. Il client dalla riga di proxyguard-server
+
+Con `-logip` proxyguard-server scrive una riga per tunnel: `<l'estremo che
+serve> proxied as <la provenienza vista da WireGuard>`. Dietro Apache il primo
+indirizzo è quello di Apache (`127.0.0.1:45442 proxied as 127.0.0.1:46312`): per
+questo oggi la riga serve solo a collegare l'apertura del tunnel di Apache a
+WireGuard. Con il TLS proprio il primo indirizzo è l'app stessa
+(`192.0.2.77:40112 proxied as 127.0.0.1:46312`): quella riga basta da sola per
+una provenienza esatta, senza Apache né proxyguard-watcher. In
+`eduvpn-logger.py`:
+
+- `_parse_proxyguard_proxied()` restituisce solo la porta del primo indirizzo:
+  farle restituire anche l'IP, e passarlo avanti (l'elemento della coda creato
+  in `_reader_journal()`, diviso in `main()`, poi `on_pg_proxied()`).
+- `on_pg_proxied()`: quando quell'IP non è di loopback, tenere la riga sotto il
+  secondo indirizzo (`127.0.0.1:46312`, unico sulla macchina), non sotto la porta
+  del primo come fa `_pg_proxied`: le app scelgono da sole la porta di
+  provenienza, e due possono usare la stessa.
+- `_match_tcp_start()`: prima delle aperture di Apache, cercare una riga così il
+  cui secondo indirizzo è l'endpoint WireGuard del peer, nella stessa finestra di
+  tempo, e usarla una sola volta (toglierla); indicarla come esatta
+  (`tcp_match=port`, o un valore nuovo descritto in
+  [Formato del log](#formato-del-log)).
+- L'avviso `ProxyGuard (TCP) session but no tunnel start read`, in
+  `_match_tcp_start()`: contare queste righe come aperture di tunnel, altrimenti
+  scatta per ogni sessione TCP.
+- Potare e salvare queste righe come `_pg_proxied` (`_prune_locked()`,
+  `save_state()`, `load_state()`): limitate, e conservate tra i riavvii.
+- Mantenere la regola di fiducia: righe di proxyguard-server solo dalla sua unit
+  (`_trusted_proxyguard_entry()`). Il primo indirizzo è il peer TCP che vede
+  proxyguard-server: esatto, a meno che davanti ci sia un bilanciatore che
+  riscrive gli indirizzi, come per UDP ([Limiti](#limiti)).
+- Verificare il formato della riga sulla release: il parser (`_PG_PROXIED_RE`)
+  confronta di proposito la riga intera, perché le righe d'errore di
+  proxyguard-server riportano ciò che inviano i client.
+
+### 2. install.sh
+
+Oggi ProxyGuard viene riconosciuto solo dal VirtualHost di Apache (`PG_VHOST`):
+senza, tutta la parte ProxyGuard viene saltata.
+
+- Riconoscere la nuova configurazione dalla unit di proxyguard-server:
+  `systemctl show -p LoadCredential proxyguard-server` che nomina
+  `fullchain.pem`, o un `LISTEN` (`systemctl show -p Environment
+  proxyguard-server`) non su `127.0.0.1` né `::1`.
+- Allora configurare `-logip` come oggi (il drop-in con `OTHER_ARGS`, il riavvio
+  chiesto), ma senza file di configurazione Apache (né trace né
+  `ErrorLogFormat`) e senza proxyguard-watcher.
+- Indicarla nel controllo finale, per esempio come
+  `PG sources     exact (proxyguard-server with its own TLS)`, e aggiornare
+  questo README dove descrive ProxyGuard.
+
+### 3. Un proxy su un'altra macchina
+
+WireGuard vede allora l'indirizzo del proxy, non `127.0.0.1`, ed eduvpn-logger
+prende la sessione per una UDP qualsiasi. Per supportarla servono:
+
+- un'impostazione con gli indirizzi dei proxy (per esempio
+  `EDUVPN_PROXYGUARD_PEERS`), controllata dove oggi si controlla il loopback:
+  `_is_loopback()` è l'unico punto che decide che un endpoint è ProxyGuard;
+- le righe del proxy sulla macchina eduVPN: quelle `-logip` di
+  proxyguard-server, e le aperture dei tunnel di Apache se lì c'è Apache davanti,
+  per esempio inoltrando il journal del proxy su TLS (`systemd-journal-remote`, o
+  rsyslog con TLS);
+- una regola di fiducia per queste righe, in base alla macchina che le invia
+  (`_MACHINE_ID` o `_HOSTNAME` di journald, su un canale autenticato), perché
+  `_SYSTEMD_UNIT` nomina allora una unit dell'altra macchina.
+
+Le righe si possono unire sul secondo indirizzo solo senza NAT tra il proxy e la
+macchina eduVPN: proxyguard-server scrive l'indirizzo del proprio socket UDP,
+WireGuard lo vede dopo il NAT.
+
+### Verifica
+
+Un'app che si connette tramite un proxyguard-server così deve ricevere
+`event=connect … src_ip="<il suo indirizzo pubblico>" src_port=… transport=tcp tcp_match=port`,
+due app che aprono tunnel nello stesso momento devono avere ciascuna il proprio
+indirizzo, e la configurazione con Apache davanti deve funzionare come prima.
+Finché eduvpn-logger non la supporta, tieni Apache davanti a proxyguard-server:
+le provenienze sono esatte da ProxyGuard 2.1.1.
 
 ## Domande frequenti
 
