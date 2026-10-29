@@ -16,7 +16,7 @@ la [documentazione di eduVPN](https://docs.eduvpn.org/server/v3/logging.html)
 lo dice esplicitamente (*"currently only available when clients connect using
 OpenVPN"*). Con WireGuard nessun log risponde alle domande che prima o poi un
 team di risposta agli incidenti deve affrontare: *quale account c'era dietro
-203.0.113.45 ieri notte? Da dove si è connessa alice? Quando è iniziata e
+203.0.113.45 ieri notte? Da dove si è connessa giulia? Quando è iniziata e
 finita quella sessione?* Il portale conosce l'utente ma non l'indirizzo.
 WireGuard conosce l'indirizzo ma non l'utente, non ha il concetto di
 connessione e non registra nulla. Dietro ProxyGuard, il ripiego di eduVPN che
@@ -29,21 +29,22 @@ WireGuard e Apache, li unisce sulla public key WireGuard e scrive una riga
 su file e su syslog:
 
 ```
-2026-04-15T09:58:03.412871+02:00 event=connect user=alice profile=staff device=ios conn=soAQTNO...= tunnel_ip4="10.20.0.5" tunnel_ip6="fd00:20::5" src_ip="203.0.113.45" src_port=48049 transport=udp country="Italy" city="Trieste"
-2026-04-15T10:41:22.090113+02:00 event=roam user=alice profile=staff device=ios conn=soAQTNO...= tunnel_ip4="10.20.0.5" tunnel_ip6="fd00:20::5" src_ip_old="203.0.113.45" src_port_old=48049 src_ip="198.51.100.12" src_port=51234 transport=udp country="Italy" city="Trieste"
-2026-04-15T11:02:57.731204+02:00 event=disconnect user=alice profile=staff device=ios conn=soAQTNO...= bytes_in=227252 bytes_out=49292 src_ip="198.51.100.12" src_port=51234 transport=udp country="Italy" city="Trieste"
-2026-04-15T12:10:04.861203+02:00 event=connect user=bob profile=students device=windows conn=GUUepz8z...= tunnel_ip4="10.20.1.9" tunnel_ip6="fd00:21::9" src_ip="192.0.2.77" src_port=40112 transport=tcp tcp_candidates=1 country="Austria" city="Vienna"
-2026-04-15T13:27:41.528310+02:00 event=disconnect user=bob profile=students device=windows conn=GUUepz8z...= bytes_in=18733211 bytes_out=402115980 src_ip="192.0.2.77" src_port=40112 transport=tcp inferred=1 country="Austria" city="Vienna"
+2026-04-15T09:58:03.412871+02:00 event=connect user=giulia profile=staff device=ios conn=soAQTNO...= tunnel_ip4="10.20.0.5" tunnel_ip6="fd00:20::5" src_ip="203.0.113.45" src_port=48049 transport=udp country="Italy" city="Trieste"
+2026-04-15T10:41:22.090113+02:00 event=roam user=giulia profile=staff device=ios conn=soAQTNO...= tunnel_ip4="10.20.0.5" tunnel_ip6="fd00:20::5" src_ip_old="203.0.113.45" src_port_old=48049 src_ip="198.51.100.12" src_port=51234 transport=udp country="Italy" city="Trieste"
+2026-04-15T11:02:57.731204+02:00 event=disconnect user=giulia profile=staff device=ios conn=soAQTNO...= bytes_in=227252 bytes_out=49292 src_ip="198.51.100.12" src_port=51234 transport=udp country="Italy" city="Trieste"
+2026-04-15T12:10:04.861203+02:00 event=connect user=marco profile=students device=windows conn=GUUepz8z...= tunnel_ip4="10.20.1.9" tunnel_ip6="fd00:21::9" src_ip="192.0.2.77" src_port=40112 transport=tcp tcp_match=port country="Austria" city="Vienna"
+2026-04-15T13:27:41.528310+02:00 event=disconnect user=marco profile=students device=windows conn=GUUepz8z...= bytes_in=18733211 bytes_out=402115980 src_ip="192.0.2.77" src_port=40112 transport=tcp inferred=1 country="Austria" city="Vienna"
 ```
 
-*alice si connette da casa, passa alla rete mobile e si disconnette; bob
-raggiunge il server tramite ProxyGuard, poi il portatile di bob va in
+*giulia si connette da casa, passa alla rete mobile e si disconnette; marco
+raggiunge il server tramite ProxyGuard, poi il portatile di marco va in
 sospensione (public key abbreviate).*
 
 - **Completo**: utente, profilo, dispositivo, indirizzi del tunnel, IP e porta
   pubblici di provenienza (IPv4 e IPv6), trasporto, traffico, paese e città.
 - **Vede oltre ProxyGuard**: ricava l'indirizzo reale dei client che
-  trasportano WireGuard su HTTPS, e dice quanto è certo ogni abbinamento.
+  trasportano WireGuard su HTTPS, in modo esatto con ProxyGuard 2.1.1 o
+  successivo, e dice come ha trovato ciascuno.
 - **Autosufficiente**: un daemon Python in un solo file, solo standard
   library, più un piccolo servizio di supporto per ProxyGuard. Niente da
   compilare, nessuna patch a eduVPN, nessun modulo del kernel.
@@ -79,14 +80,15 @@ diverso, e nessuna basta da sola:
 | Portale (`vpn-user-portal`) | utente, profilo, public key, indirizzi del tunnel e traffico di ogni sessione | da dove si connette il client: lo registra solo per OpenVPN |
 | WireGuard | public key, endpoint attuale, ultimo handshake e traffico di ogni peer | utenti, connessioni, storia: non registra nulla, e un nuovo endpoint sostituisce in silenzio il precedente |
 | Apache, con ProxyGuard | l'indirizzo reale di ogni tunnel TCP | quale peer WireGuard viaggia nel tunnel; il suo access log scrive una richiesta solo quando finisce, giorni dopo per un tunnel lungo |
+| proxyguard-server | a quale connessione di Apache appartiene ogni porta di provenienza vista da WireGuard: lo registra da ProxyGuard 2.1, se richiesto (`-logip`) | l'indirizzo del client |
 
 La public key WireGuard è l'unico identificatore che portale e WireGuard hanno
-in comune, e nulla collega un tunnel di Apache a un peer WireGuard. I logger
-WireGuard generici, come [wglogger](https://codeberg.org/flaruina/wglogger),
-registrano public key ed endpoint ma lasciano a te l'unione con il portale, e
-non vedono oltre ProxyGuard, il cui traffico arriva a WireGuard da
-`127.0.0.1`. eduvpn-logger ricostruisce i collegamenti mancanti, in tempo
-reale.
+in comune, e solo proxyguard-server, nel mezzo, sa quale tunnel di Apache
+arriva a WireGuard da quale porta. I logger WireGuard generici, come
+[wglogger](https://codeberg.org/flaruina/wglogger), registrano public key ed
+endpoint ma lasciano a te l'unione con il portale, e non vedono oltre
+ProxyGuard, il cui traffico arriva a WireGuard da `127.0.0.1`. eduvpn-logger
+ricostruisce i collegamenti mancanti, in tempo reale.
 
 ## Cosa lo rende diverso
 
@@ -95,11 +97,17 @@ reale.
   li legge ogni 2 secondi e ne ricava gli eventi di connect, roam e
   disconnect: nessun modulo del kernel, niente conntrack né eBPF, nessuna patch
   a eduVPN.
-- **L'indirizzo reale dietro ProxyGuard.** Apache conosce il client di un
-  tunnel TCP, WireGuard conosce il peer, e nulla lega i due. eduvpn-logger fa
-  registrare ad Apache l'apertura di ogni tunnel e la abbina nel tempo
-  all'handshake WireGuard. Ogni tunnel viene attribuito una sola volta, e il
-  campo `tcp_candidates` dice quanti tunnel erano possibili, così un
+- **L'indirizzo reale dietro ProxyGuard, esatto.** Apache conosce il client di
+  un tunnel TCP, WireGuard conosce il peer, e solo proxyguard-server sa chi è
+  chi. Con ProxyGuard 2.1.1 o successivo eduvpn-logger fa registrare a
+  proxyguard-server la connessione di Apache dietro ogni porta di provenienza
+  vista da WireGuard, e ad Apache la porta di quella connessione all'apertura
+  del tunnel: l'indirizzo si segue porta per porta dal peer WireGuard fino al
+  client (`tcp_match=port`). Con un ProxyGuard precedente, che non registra
+  nulla per tunnel (o la cui unit non può ricevere `-logip` in sicurezza,
+  2.1.0), l'apertura del tunnel viene abbinata nel tempo
+  all'handshake WireGuard (`tcp_match=time`), ogni apertura attribuita una sola
+  volta, e `tcp_candidates` dice quanti tunnel erano possibili, così un
   abbinamento ambiguo si riconosce come tale.
 - **L'identità dalla fonte autorevole.** Utente e profilo arrivano dal
   portale: dalla riga del suo database per la public key della sessione
@@ -127,13 +135,16 @@ reale.
   federati (eduPersonTargetedID, pairwise-id) restano intatti.
 - **Sicuro per impostazione predefinita.** Gli eventi del portale sono
   accettati solo da account di sistema, in base all'UID del mittente che
-  journald registra e che il mittente non può falsificare. Il servizio gira in
+  journald registra e che il mittente non può falsificare, e le righe di
+  proxyguard-server solo dal suo servizio, in base alla unit che journald
+  registra. Il servizio gira in
   una sandbox systemd con quattro capability e senza accesso alla rete. I log
   sono privati (`0640 root:adm`) e conservati 180 giorni.
 - **Pronto all'uso.** `install.sh` lo installa con un comando, attiva il log
-  delle connessioni del portale e il trace ProxyGuard di Apache se sono spenti
-  (ogni modifica verificata prima di essere applicata, con backup) e controlla
-  il risultato; `install.sh --uninstall` lo rimuove. Provato su Debian, Ubuntu,
+  delle connessioni del portale, il trace ProxyGuard di Apache e il log dei
+  tunnel di proxyguard-server se sono spenti (ogni modifica verificata prima di
+  essere applicata, con backup, e il riavvio di proxyguard-server chiesto prima)
+  e controlla il risultato; `install.sh --uninstall` lo rimuove. Provato su Debian, Ubuntu,
   AlmaLinux e Fedora, e su server eduVPN 3 reali.
 
 ## Come funziona
@@ -144,6 +155,7 @@ flowchart LR
         portal["vpn-user-portal"] -->|"CONNECT / DISCONNECT"| journal[("journald")]
         portal -->|"sessioni"| db[("DB del portale")]
         apache["Apache /proxyguard/"] -->|"apertura tunnel"| watcher["proxyguard-watcher"]
+        pgs["proxyguard-server"] -->|"porte dei tunnel (-logip)"| journal
         wg["WireGuard wg0"]
         journal --> logger{{"eduvpn-logger"}}
         db -.->|"in mancanza dell'evento"| logger
@@ -161,7 +173,8 @@ Il daemon legge queste sorgenti e le unisce sulla **public key WireGuard**:
 | eventi del portale | utente, profilo, public key, IP del tunnel, traffico | journald, `SYSLOG_IDENTIFIER=vpn-user-portal`, dalla posizione salvata |
 | database del portale | utente, profilo, IP del tunnel e app di una public key | `/var/lib/vpn-user-portal/db.sqlite`, tabella `wg_peers`, sola lettura, quando manca un evento |
 | WireGuard | endpoint (`IP:porta` pubblici), ultimo handshake, traffico di ogni peer | `wg show all dump`, ogni 2 s |
-| ProxyGuard *(opzionale)* | `IP:porta` reali del client di ogni tunnel TCP, alla sua apertura | `ErrorLog` di Apache → `proxyguard-watcher` → `proxyguard_start.log` |
+| ProxyGuard *(opzionale)* | `IP:porta` reali del client di ogni tunnel TCP, alla sua apertura, e la porta della connessione di Apache verso proxyguard-server | `ErrorLog` di Apache → `proxyguard-watcher` → `proxyguard_start.log` |
+| proxyguard-server *(ProxyGuard 2.1+)* | la porta di provenienza che WireGuard vede per ogni connessione di Apache | journald, `SYSLOG_IDENTIFIER=proxyguard-server`, con `-logip` |
 
 ### Dallo stato di WireGuard alle sessioni
 
@@ -206,7 +219,8 @@ Sulle reti che bloccano UDP le app eduVPN raggiungono WireGuard tramite
 [ProxyGuard](https://docs.eduvpn.org/server/v3/wireguard.html): una
 connessione HTTPS ad Apache, trasformata in tunnel e passata a
 `proxyguard-server`, che consegna i pacchetti WireGuard alla porta UDP locale.
-WireGuard vede quindi ognuno di questi client come `127.0.0.1`.
+WireGuard vede quindi ognuno di questi client come `127.0.0.1`, ogni tunnel da
+una porta sua.
 
 ```mermaid
 sequenceDiagram
@@ -216,23 +230,38 @@ sequenceDiagram
     participant W as WireGuard
     participant L as eduvpn-logger
     C->>A: HTTPS verso /proxyguard/, trasformato in tunnel
-    A-->>L: tunnel aperto da 192.0.2.77:40112 (ErrorLog, proxyguard-watcher)
-    A->>P: tunnel
-    P->>W: pacchetti WireGuard da 127.0.0.1
-    W-->>L: handshake di un nuovo peer, endpoint 127.0.0.1 (wg show)
-    Note over L: apertura libera<br/>più vicina<br/>src_ip=192.0.2.77<br/>tcp_candidates=1
+    A->>P: tunnel, dalla porta 45442
+    P-->>L: 127.0.0.1:45442 proxied as 127.0.0.1:46312 (journal, -logip)
+    A-->>L: tunnel di 192.0.2.77:40112 sulla porta 45442 (ErrorLog, proxyguard-watcher)
+    P->>W: pacchetti WireGuard da 127.0.0.1:46312
+    W-->>L: nuovo peer, endpoint 127.0.0.1:46312 (wg show)
+    Note over L: 46312 → 45442 → 192.0.2.77:40112<br/>tcp_match=port
 ```
 
-Con il trace che `install.sh` attiva (solo per le richieste di ProxyGuard,
-qualunque sia il loro percorso), Apache scrive una riga all'apertura di un
-tunnel (`AH10212 ... tunnel running`, con `[client IP:porta]`) e
-`proxyguard-watcher` la trasforma in un evento di apertura. Una nuova sessione
-WireGuard, o un nuovo tunnel di una sessione attiva, viene abbinata
-all'apertura più vicina non ancora assegnata, da circa 30 s prima a 3 s dopo
-il momento in cui WireGuard la vede; l'apertura resta poi a quella sessione,
-così non può essere data a un altro client. Se l'apertura non è ancora
-arrivata, il connect la attende fino a 20 s. `tcp_candidates` indica quante
-aperture c'erano nella finestra: `1` significa che non c'erano altri candidati.
+Con quello che `install.sh` configura, due righe descrivono ogni tunnel quando
+si apre. Apache (con il trace delle sole richieste di ProxyGuard, qualunque sia
+il loro percorso) scrive `AH10212 ... tunnel running` con il client,
+`[client 192.0.2.77:40112]`, e la porta locale della sua connessione verso
+proxyguard-server, `[pgport 45442]`; `proxyguard-watcher` la trasforma in un
+evento di apertura. proxyguard-server (ProxyGuard 2.1 o successivo, `-logip`;
+configurato da `install.sh` dalla 2.1.1)
+scrive la porta di provenienza che quella connessione ha verso WireGuard:
+`127.0.0.1:45442 proxied as 127.0.0.1:46312`. Un peer WireGuard che compare su
+`127.0.0.1:46312` si segue così fino al suo client: `tcp_match=port`. Le porte
+vengono riusate nel tempo, quindi si uniscono solo righe dello stesso momento:
+l'apertura e la riga di proxyguard-server entro 5 s l'una dall'altra, entrambe
+degli ultimi 30 s.
+
+Senza la riga di proxyguard-server (ProxyGuard precedente alla 2.1, che non
+registra nulla per tunnel; ProxyGuard 2.1.0 senza la configurazione manuale;
+proxyguard-server non ancora riavviato dopo `install.sh`; una riga persa) una nuova sessione WireGuard, o un nuovo tunnel
+di una sessione attiva, viene abbinata all'apertura più vicina nel tempo, da
+circa 30 s prima a 3 s dopo il momento in cui WireGuard la vede, escluse le
+aperture che proxyguard-server mostra appartenere ad altri tunnel:
+`tcp_match=time`, con `tcp_candidates` il numero di aperture nella finestra
+(`1`: nessun altro candidato). In entrambi i casi un'apertura viene assegnata
+una sola volta, così non può essere data a un altro client, e se non è ancora
+arrivata il connect la attende fino a 20 s.
 
 ### Tempi
 
@@ -242,7 +271,8 @@ aperture c'erano nella finestra: `1` significa che non c'erano altri candidati.
 | attesa dell'utente di un nuovo peer | 10 s | `EDUVPN_CONNECT_GRACE_SEC` |
 | attesa dell'apertura ProxyGuard di una sessione TCP | 20 s | — |
 | attesa del primo handshake di una sessione annunciata dal portale | 120 s | — |
-| finestra di abbinamento ProxyGuard | 30 s + una lettura prima, 3 s dopo che WireGuard vede il tunnel | — |
+| finestra di abbinamento ProxyGuard (per porta e nel tempo) | 30 s + una lettura prima, 3 s dopo che WireGuard vede il tunnel | — |
+| apertura e riga di proxyguard-server dello stesso tunnel | entro 5 s | — |
 | intervallo minimo tra righe roam dello stesso peer | 30 s | `EDUVPN_ROAM_MIN_INTERVAL_SEC` |
 | silenzio dell'handshake prima di un disconnect dedotto | 180 s (minimo) | `EDUVPN_DISCONNECT_AFTER_SEC` |
 
@@ -279,6 +309,10 @@ segnalata, e il daemon riparte dal momento attuale.
 - Il database del portale viene letto solo se è SQLite, il default di eduVPN.
   Con PostgreSQL o MariaDB tutto funziona dagli eventi del portale, senza il
   ripiego sul database (vedi [Limiti](#limiti)).
+- *Opzionale:* ProxyGuard 2.1.1 o successivo (`proxyguard-server` dal
+  repository di eduVPN, sulla stessa macchina) per indirizzi ProxyGuard esatti;
+  con uno precedente vengono abbinati nel tempo (2.1.0: esatti solo con la
+  [configurazione manuale](#configurazione-manuale)).
 - *Opzionale:* `python3-maxminddb` e un database MaxMind GeoLite2-City per
   `country` e `city` ([GeoIP](#geoip-opzionale)).
 
@@ -301,6 +335,7 @@ di eduVPN.
 |---|---|
 | log delle connessioni del portale | se è spento lo attiva in `/etc/vpn-user-portal/config.php` con i template consigliati. La modifica viene verificata con PHP prima di sostituire il file, l'originale resta in `config.php.eduvpn-logger.bak` e i template già impostati restano com'erano. |
 | IP di provenienza ProxyGuard | se un VirtualHost inoltra ProxyGuard (`/proxyguard/`, o qualunque percorso con upgrade a `UoTLV`): fa registrare ad Apache le aperture dei tunnel, con un file di configurazione proprio (`eduvpn-logger-proxyguard.conf`, poi `configtest` e reload graceful; se il `configtest` fallisce resta la versione precedente, o nessuna), e avvia `proxyguard-watcher` sull'`ErrorLog` di quel VirtualHost |
+| ProxyGuard, esatto (2.1.1 o successivo) | nello stesso file, a livello di server, il formato di default dell'error log di Apache più la porta della connessione di ogni tunnel verso proxyguard-server, solo nelle righe di trace (un `ErrorLogFormat` già tuo non viene toccato: vedi [Configurazione manuale](#configurazione-manuale)); un drop-in, `proxyguard-server.service.d/eduvpn-logger.conf`, che imposta `OTHER_ARGS=-logip` per proxyguard-server, lasciando la riga di comando al pacchetto. Riavviare proxyguard-server fa cadere i tunnel ProxyGuard aperti (le app si riconnettono subito), quindi lo chiede; senza terminale lo lascia a te, con una nota. Con ProxyGuard precedente alla 2.1 non cambia nulla e il controllo dice di aggiornarlo; con la 2.1.0, la cui unit non ha `OTHER_ARGS`, non cambia nulla nemmeno (sostituirne la riga di comando potrebbe fermare proxyguard-server dopo un aggiornamento del pacchetto): riesegui `install.sh` quando è installata la 2.1.1. |
 | pacchetti | `wireguard-tools`, `python3`, `logrotate`; opzionali `python3-maxminddb`, e `geoipupdate` con un account MaxMind (il pacchetto di MaxMind dove la distribuzione non lo ha, verificato con i checksum pubblicati). Solo quelli mancanti: nulla di già installato viene aggiornato. |
 | programmi, unit | `/usr/local/sbin/eduvpn-logger.py`, `proxyguard-watcher.py`; `/etc/systemd/system/eduvpn-logger.service`, `proxyguard-watcher.service` |
 | log | `/var/log/eduvpn` (`2750 root:adm`), ruotati ogni giorno da `/etc/logrotate.d/eduvpn-logger`. Se rsyslog è installato e gira come root (Debian, EL, Fedora; non Ubuntu), vi scrive anche la copia syslog, in `eduvpn-syslog.log`. Entrambi i file si possono adattare (conservazione, inoltro): una volta modificati, gli aggiornamenti li mantengono, con un avviso. |
@@ -315,6 +350,7 @@ Alla fine esegue un controllo:
   portal DB      ok (128 WireGuard configurations)
   WireGuard      wg0
   ProxyGuard     watcher active, following /var/log/apache2/vpn.example.org_ssl_error.log
+  PG sources     exact, by port (proxyguard-server 2.1.1 -logip)
   GeoIP          off (optional: sudo GEOIP_ACCOUNT_ID=<MaxMind account> ./install.sh)
 
 ==> Ready. Output: /var/log/eduvpn/eduvpn.log (also journalctl -t eduvpn-logger)
@@ -371,7 +407,9 @@ con l'utente e l'IP pubblico di provenienza. Gli avvisi del daemon sono in
 | nessuna riga | servizio non attivo (`systemctl status eduvpn-logger`), o WireGuard non leggibile (avviso `` `wg show all dump` failed ``): riesegui `install.sh` e leggi il controllo finale |
 | `inferred=1` su tutti i connect e disconnect | log delle connessioni del portale spento: riesegui `install.sh` |
 | `user=-` nelle righe connect | database del portale non trovato o non leggibile: controlla `EDUVPN_PORTAL_DB`; database del portale PostgreSQL o MariaDB (vedi [Limiti](#limiti)); oppure peer di un'interfaccia WireGuard non eduVPN: imposta `EDUVPN_WG_INTERFACES` |
-| `transport=tcp src_ip="-"`, o l'avviso `ProxyGuard (TCP) session but no tunnel start read` | Apache non traccia le richieste di ProxyGuard, o il watcher legge l'`ErrorLog` sbagliato (o un `ErrorLogFormat` personalizzato senza `[client %a] %M`): riesegui `install.sh` (anche dopo aver cambiato il VirtualHost), poi guarda `systemctl cat proxyguard-watcher` e la coda di `proxyguard_start.log` |
+| `transport=tcp src_ip="-"`, o l'avviso `ProxyGuard (TCP) session but no tunnel start read` | Apache non traccia le richieste di ProxyGuard, o il watcher legge l'`ErrorLog` sbagliato (o un `ErrorLogFormat` tuo in cui `[client\ %a]` non è seguito dal messaggio, o da `[pgport ...]` e dal messaggio): riesegui `install.sh` (anche dopo aver cambiato il VirtualHost), poi guarda `systemctl cat proxyguard-watcher` e la coda di `proxyguard_start.log` |
+| `tcp_match=time` nelle righe ProxyGuard | ProxyGuard precedente alla 2.1.1, proxyguard-server non riavviato dopo `install.sh`, o un `ErrorLogFormat` tuo senza `[pgport]`: la riga `PG sources` del controllo dice quale |
+| avviso `ignoring proxyguard-server entries from unit …` | una riga con il nome di proxyguard-server è stata registrata da un'altra unit, per esempio con `logger -t proxyguard-server`: scartata (vedi [Limiti](#limiti)) |
 | avviso `ignoring unparsable/non-WireGuard event` | template personalizzato senza `CONN=`, evento OpenVPN (ignorato di proposito), o una riga in cui un identificativo utente imita il template (scartata: la sessione viene seguita da WireGuard, l'utente dal database del portale) |
 | avviso `untrusted _UID=…` | scartato un evento del portale registrato da un account non di sistema (vedi [Limiti](#limiti)) |
 
@@ -445,6 +483,59 @@ ExecStart=/bin/sh -c 'exec tail -n 0 -F /percorso/error.log | python3 -u /usr/lo
 </details>
 
 <details>
+<summary>IP di provenienza ProxyGuard esatti (ProxyGuard 2.1 o successivo)</summary>
+
+Apache: il formato dell'error log del VirtualHost di eduVPN, o di tutto il
+server, deve aggiungere la porta della connessione di ogni tunnel verso
+proxyguard-server, subito dopo il client. Questo è il formato di default di
+Apache più quel campo:
+
+```apache
+ErrorLogFormat "[%{u}t] [%-m:%l] [pid\ %P% :tid\ %{g}T% ] %7F: %E: [client\ %a] [pgport\ %8{proxy-source-port}n] %M% ,\ referer:\ %{Referer}i"
+```
+
+Prima di Apache 2.4.60 il default registra `%T` invece di `%{g}T`. Con un
+`ErrorLogFormat` già tuo, aggiungi `[pgport\ %8{proxy-source-port}n]` subito
+dopo `[client\ %a]`. `%8` limita il campo alle righe di trace (l'apertura del
+tunnel): le altre righe restano come prima.
+
+proxyguard-server deve registrare i suoi tunnel. Con una unit il cui
+`ExecStart=` finisce con `${OTHER_ARGS}` (ProxyGuard 2.1.1 o successivo),
+imposta `OTHER_ARGS=-logip` con un drop-in (`sudo systemctl edit
+proxyguard-server.service`, poi `[Service]` e `Environment=OTHER_ARGS=-logip`),
+oppure in `/etc/default/proxyguard-server` (`/etc/sysconfig/proxyguard-server`
+su EL/Fedora), che prevale sul drop-in.
+
+La unit di ProxyGuard 2.1.0 non ha altro modo di passare `-logip` che la riga
+di comando. `install.sh` non la scrive, ma se c'è la riconosce e configura la
+parte di Apache. A tuo rischio: ripeti la riga `ExecStart=` della unit
+(`systemctl cat proxyguard-server`; su EL/Fedora inizia con
+`proxyguard-server`, senza `/usr/sbin/`) aggiungendo `-logip`. La copia non
+segue gli aggiornamenti del pacchetto: se uno cambia quella riga,
+proxyguard-server continua con quella vecchia, o non parte, finché non
+aggiorni il drop-in.
+
+```bash
+sudo systemctl edit proxyguard-server.service
+```
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/proxyguard-server -listen ${LISTEN} -to ${TO} -logip
+```
+
+Togli questo drop-in quando arriva la 2.1.1, poi riesegui `install.sh`. In
+entrambi i casi, in un momento tranquillo, visto che i tunnel ProxyGuard
+aperti cadono e le app si riconnettono:
+
+```bash
+sudo systemctl restart proxyguard-server
+```
+
+</details>
+
+<details>
 <summary>Installazione senza <code>install.sh</code></summary>
 
 ```bash
@@ -458,7 +549,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now eduvpn-logger.service
 ```
 
-Poi le due sezioni sopra. Per GeoIP configura `geoipupdate` e pianificalo ogni
+Poi le sezioni sopra. Per GeoIP configura `geoipupdate` e pianificalo ogni
 settimana (`systemd/eduvpn-logger-geoipupdate.timer`).
 
 </details>
@@ -564,7 +655,8 @@ usa quella.
 | `src_ip_old`, `src_port_old` | roam | indirizzo di provenienza prima del roam |
 | `src_ip`, `src_port` | tutti | indirizzo pubblico di provenienza, IPv4 o IPv6; `-` se ignoto |
 | `transport` | tutti | `udp`, `tcp` (ProxyGuard) o `unknown` |
-| `tcp_candidates` | connect, roam su `tcp` | aperture di tunnel fra cui è stato scelto l'IP; `1` = nessun altro candidato (vedi [Limiti](#limiti)) |
+| `tcp_match` | connect, roam su `tcp` con una provenienza | come è stata trovata: `port`, attraverso le porte del tunnel (esatta); `time`, l'apertura di tunnel più vicina nel tempo |
+| `tcp_candidates` | connect, roam con `tcp_match=time` | aperture di tunnel fra cui è stato scelto l'IP; `1` = nessun altro candidato (vedi [Limiti](#limiti)) |
 | `inferred` | connect, disconnect | `1`: dedotto dallo stato di WireGuard, non riportato dal portale |
 | `country`, `city` | con GeoIP, IP pubblici | posizione di `src_ip` |
 
@@ -588,7 +680,7 @@ legge insieme a quello corrente.
 zgrep -hE 'src_ip(_old)?="203\.0\.113\.45"' /var/log/eduvpn/eduvpn.log*
 
 # Tutto quello che ha fatto un utente
-zgrep -h ' user=alice ' /var/log/eduvpn/eduvpn.log*
+zgrep -h ' user=giulia ' /var/log/eduvpn/eduvpn.log*
 
 # Chi aveva un indirizzo del tunnel, per esempio visto nel log di un firewall:
 # la riga connect indica utente e public key, poi si segue la chiave fino al disconnect
@@ -601,14 +693,28 @@ zgrep -h ' event=connect .*country=' /var/log/eduvpn/eduvpn.log* | grep -v 'coun
 
 ## Limiti
 
-- **Gli IP di provenienza ProxyGuard sono abbinati per tempo.** L'apertura del
-  tunnel in Apache e l'handshake WireGuard non condividono alcun identificatore,
-  quindi si usa l'apertura più vicina degli ultimi 30 s, una sola volta. Client
-  che aprono tunnel TCP negli stessi pochi secondi possono essere scambiati, e
-  `/proxyguard/` è raggiungibile senza autenticazione. Considera `tcp_candidates`
-  maggiore di 1 come probabile, non certo; `1` vale solo se il watcher vede ogni
-  apertura (se ne manca una, quella rimasta può essere di un altro client). Gli
-  IP di provenienza UDP arrivano dal kernel e sono esatti.
+- **Gli IP di provenienza ProxyGuard sono esatti da ProxyGuard 2.1.1.** Con il
+  `-logip` di proxyguard-server e il `[pgport]` di Apache (entrambi configurati
+  da `install.sh`), ogni tunnel si segue porta per porta da WireGuard al client
+  (`tcp_match=port`). Senza (ProxyGuard precedente alla 2.1, che non registra
+  nulla per tunnel; 2.1.0 senza la configurazione manuale; proxyguard-server
+  non ancora riavviato; un `ErrorLogFormat`
+  tuo senza `[pgport]`; una riga persa, come quando journald limita un flood di
+  tunnel) si usa l'apertura più vicina degli ultimi 30 s, una sola volta
+  (`tcp_match=time`): client che aprono tunnel TCP negli stessi pochi secondi
+  possono essere scambiati, e `/proxyguard/` è raggiungibile senza
+  autenticazione. Considera `tcp_candidates` maggiore di 1 come probabile, non
+  certo; `1` vale solo se il watcher vede ogni apertura (se ne manca una, quella
+  rimasta può essere di un altro client). Gli IP di provenienza UDP arrivano dal
+  kernel e sono esatti. Più istanze di proxyguard-server sulla stessa macchina
+  devono essere unit chiamate `proxyguard-server*.service`; una su un'altra
+  macchina (un proxy dedicato) non viene seguita.
+- **Il formato dell'error log di Apache vale per tutto il server** (ProxyGuard
+  2.1.1 o successivo). È quello di default di Apache più `[pgport N]` nelle sole
+  righe di trace, che hanno solo le aperture dei tunnel ProxyGuard, quindi gli
+  altri strumenti che leggono l'error log di Apache vedono le stesse righe di
+  prima; l'unica differenza è che le righe di debug sulla connessione verso un
+  backend riportano `[client …]` invece di `[remote …]`.
 - **Gli indirizzi sono quelli che vede il server.** Un bilanciatore, firewall o
   reverse proxy davanti al server che riscrive gli indirizzi di provenienza
   (SNAT) nasconde i client dietro il proprio indirizzo. Per ProxyGuard dietro un
@@ -618,6 +724,9 @@ zgrep -h ' event=connect .*country=' /var/log/eduvpn/eduvpn.log* | grep -v 'coun
   utente locale può scrivere nel journal con `logger -t vpn-user-portal`; sono
   accettate solo le voci il cui `_UID` (impostato da journald) è un account di
   sistema (≤ `SYS_UID_MAX`, normalmente 999: root, `www-data`, `apache`).
+  proxyguard-server gira come utente dinamico, senza un UID fisso: le sue righe
+  sono accettate solo dal suo servizio (`_SYSTEMD_UNIT`, anch'esso impostato da
+  journald, che solo root può nominare).
 - **I disconnect dedotti** vengono scritti, e datati, quando si supera la soglia
   di 180 s di silenzio, cioè fino a 3 minuti dopo l'ultima attività.
 - **Mentre il daemon è fermo** i roam non vengono seguiti (una sessione che si
@@ -636,8 +745,8 @@ zgrep -h ' event=connect .*country=' /var/log/eduvpn/eduvpn.log* | grep -v 'coun
   ha `user=-`. Le sessioni annunciate dal portale, e le nuove sessioni sulle
   loro chiavi, non ne risentono. Gli utenti vengono allora solo dalle righe di
   log del portale, dove l'identificativo è scritto così com'è: uno che
-  contiene uno spazio seguito da maiuscole e `=` (`alice X=1`) viene troncato
-  lì (`alice`).
+  contiene uno spazio seguito da maiuscole e `=` (`giulia X=1`) viene troncato
+  lì (`giulia`).
 - **Campionamento.** WireGuard viene letto ogni `EDUVPN_WG_POLL_SEC`: un roam
   con ritorno dentro lo stesso intervallo non viene visto, e una sessione più
   breve di un intervallo resta senza indirizzo di provenienza (connect e
@@ -688,6 +797,16 @@ Una versione precedente al 12 ottobre 2026 non salva le sessioni quando si
 ferma: aggiornando da quella, le sessioni aperte in quel momento vengono
 annunciate di nuovo una volta (`inferred=1`), come dopo un crash.
 
+Dopo aver aggiornato proxyguard-server dalla 2.1.0 o precedente alla 2.1.1 o
+successiva, riesegui `install.sh` una volta: solo allora le sorgenti ProxyGuard
+sono esatte. Gli aggiornamenti successivi non richiedono nulla: il drop-in
+imposta solo `OTHER_ARGS`. Prima di riportare proxyguard-server sotto la 2.1, togli il drop-in
+(`/etc/systemd/system/proxyguard-server.service.d/eduvpn-logger.conf`, poi
+`sudo systemctl daemon-reload`): un proxyguard-server precedente non parte con
+`-logip`. Per tornare a una versione precedente di eduvpn-logger, esegui prima
+`install.sh --uninstall` di questa: un `proxyguard-watcher` precedente non legge
+le aperture dei tunnel con `[pgport]`.
+
 Rimozione:
 
 ```bash
@@ -695,8 +814,10 @@ cd eduvpn-logger && sudo ./install.sh --uninstall
 ```
 
 Ferma e rimuove i servizi, i programmi, le unit con i loro drop-in, lo stato,
-la policy di logrotate, lo snippet rsyslog (se non è stato modificato) e il
-tracciamento dei tunnel ProxyGuard in Apache (con reload di Apache). Lascia i
+la policy di logrotate, lo snippet rsyslog (se non è stato modificato), il
+tracciamento dei tunnel ProxyGuard e il formato dell'error log in Apache (con
+reload di Apache) e il drop-in di proxyguard-server (che registra i tunnel fino
+al suo prossimo riavvio, il quale fa cadere i tunnel ProxyGuard aperti). Lascia i
 log in `/var/log/eduvpn` (dati personali: cancellali come prevede la tua policy
 di conservazione), il log delle connessioni del portale (se l'aveva attivato
 `install.sh`, il `config.php` precedente è in `config.php.eduvpn-logger.bak`),
@@ -706,10 +827,14 @@ aggiunto a mano al VirtualHost.
 ## Domande frequenti
 
 **Modifica eduVPN?** Legge soltanto il journal e il database del portale, lo
-stato di WireGuard e il log di Apache. `install.sh` cambia due impostazioni, e
-solo se sono spente: il log delle connessioni del portale e, con ProxyGuard, il
-livello di log di Apache per le richieste di ProxyGuard. Entrambe vengono
-verificate prima di essere applicate.
+stato di WireGuard, il journal di proxyguard-server e il log di Apache.
+`install.sh` cambia, solo dove sono spenti, il log delle connessioni del
+portale e, con ProxyGuard, il livello di log di Apache per le richieste di
+ProxyGuard, il formato dell'error log di Apache e il `-logip` di
+proxyguard-server: in `config.php` (con backup) e in file propri (un file di
+configurazione Apache, un drop-in systemd), mai nei file dei pacchetti di
+eduVPN. Ogni modifica viene verificata prima di essere applicata, e il riavvio
+di proxyguard-server viene chiesto prima.
 
 **Quanto pesa?** Un `wg show all dump` ogni 2 s e una query SQLite in sola
 lettura per ogni nuova sessione (qualcuna per un peer che il portale non
@@ -722,8 +847,10 @@ riannunciarli tutti dopo un crash circa 2 s.
 sessioni OpenVPN (`originatingIp`); eduvpn-logger le ignora.
 
 **L'IP di provenienza è affidabile?** Su UDP sì: arriva dal kernel, così come
-lo vede il server (vedi [Limiti](#limiti)). Su ProxyGuard è un abbinamento per
-tempo, e `tcp_candidates` dice quanti tunnel erano possibili.
+lo vede il server (vedi [Limiti](#limiti)). Su ProxyGuard, con
+`tcp_match=port` sì: segue le porte del tunnel da WireGuard al client di
+Apache; con `tcp_match=time` è un abbinamento nel tempo, e `tcp_candidates`
+dice quanti tunnel erano possibili.
 
 **Cosa succede mentre il logger è fermo?** Gli eventi del portale vengono
 elaborati alla ripartenza, con il loro timestamp originale. Le sessioni ancora
@@ -748,7 +875,8 @@ eduvpn-logger nasce da una prima versione costruita su
 (INFN), che ha mostrato come ricavare dallo stato di WireGuard gli eventi di
 connect, roam e disconnect associando ogni endpoint alla public key del suo
 peer. Leggere la stessa associazione direttamente da `wg show` è ciò che ha
-reso questo daemon autosufficiente.
+reso questo daemon autosufficiente. Il suo `-logip`, in ProxyGuard 2.1, è ciò
+che rende esatto l'abbinamento ProxyGuard.
 
 ## Licenza
 

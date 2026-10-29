@@ -8,7 +8,8 @@
 #
 # Besides the logger it turns on, when missing, what it needs on the eduVPN side:
 # the portal's connection log (config.php, backup kept) and, with ProxyGuard,
-# Apache's trace of tunnel starts (a conf file of its own; Apache reloaded).
+# Apache's trace of tunnel starts (a conf file of its own; Apache reloaded) and
+# proxyguard-server's log of its tunnels (a drop-in; its restart is asked for).
 set -euo pipefail
 
 SBIN=/usr/local/sbin
@@ -30,6 +31,8 @@ if [ -d /etc/apache2/conf-available ]; then
 else
     PG_CONF=/etc/httpd/conf.d/eduvpn-logger-proxyguard.conf APACHECTL=apachectl APACHE_UNIT=httpd
 fi
+PGS=proxyguard-server.service
+PGS_DROPIN=$UNITS/$PGS.d/eduvpn-logger.conf
 warn() { echo "WARN: $*" >&2; }
 same() { [ -f "$2" ] && [ "$(cat "$1")" = "$(cat "$2")" ]; }  # no cmp: diffutils may be missing
 # A file administrators may adapt (log retention, forwarding to a SIEM): installed
@@ -70,10 +73,20 @@ if [ "${1:-}" = --uninstall ]; then
         rm -f "$PG_CONF"
         if $APACHECTL configtest >/dev/null 2>&1; then systemctl try-reload-or-restart "$APACHE_UNIT.service" || true; fi
     fi
+    PGS_LEFT=0
+    if [ -f "$PGS_DROPIN" ]; then
+        rm -f "$PGS_DROPIN"
+        rmdir --ignore-fail-on-non-empty "$UNITS/$PGS.d"
+        PGS_LEFT=1
+    fi
     systemctl daemon-reload
     echo "==> Removed. Left in place: the logs in /var/log/eduvpn (personal data: delete them as your"
     echo "    retention policy says), the portal's connection log (config.php as it was before install.sh:"
     echo "    $PORTAL_CONF.eduvpn-logger.bak, if it turned the log on), /etc/GeoIP.conf, the packages."
+    if [ "$PGS_LEFT" = 1 ]; then
+        echo "    proxyguard-server logs its tunnels until it next restarts (restarting it drops the open"
+        echo "    ProxyGuard tunnels: sudo systemctl restart proxyguard-server)."
+    fi
     exit 0
 fi
 
@@ -308,23 +321,91 @@ fi
 
 # ProxyGuard: Apache logs a tunnel start (client address) only with the proxy
 # module at trace1 for ProxyGuard's requests. A conf file of its own, not an edit
-# of the eduVPN VirtualHost; skipped if the administrator already traces it.
+# of the eduVPN VirtualHost; the trace is skipped if the administrator already has
+# one. Exact sources: proxyguard-server 2.1+ logs, for each tunnel, Apache's
+# connection and the source port WireGuard sees (-logip, with a drop-in of its own),
+# and Apache's error log format adds the port of that connection to the start.
+# Older ProxyGuard logs nothing per tunnel: its tunnels are matched by time.
+PG_EXACT=""  # why sources are matched by time (Check); empty: by port
+PGS_NEW=""   # the drop-in's [Service] lines, when one is needed
+PGS_VER=""
 if [ -n "$PG_VHOST" ]; then
+    PGS_BIN=$(command -v proxyguard-server || true)
+    if [ -z "$PGS_BIN" ]; then
+        PG_EXACT="proxyguard-server is not on this host"
+    else
+        PGS_VER=$(timeout 10 "$PGS_BIN" -version 2>&1 | sed -n 's/^Version: //p' || true)
+        if [[ $(timeout 10 "$PGS_BIN" -help 2>&1 || true) != *-logip* ]]; then
+            PG_EXACT="proxyguard-server ${PGS_VER:-?} does not log its tunnels (2.1 or later does)"
+            NOTES+=("Upgrade proxyguard-server to 2.1 or later from the eduVPN repository (apt install --only-upgrade proxyguard-server, or dnf upgrade proxyguard-server), then re-run install.sh: until then ProxyGuard sources are matched by time (README: Limitations).")
+        else
+            PGS_UNIT=$(systemctl show -p FragmentPath --value "$PGS" 2>/dev/null || true)
+            PGS_EXEC=$(grep -sE '^ExecStart=' "$PGS_UNIT" | tail -n 1 || true)
+            # EnvironmentFile= wins over Environment=: an OTHER_ARGS set there stays.
+            PGS_ENVF=$(systemctl show -p EnvironmentFiles --value "$PGS" 2>/dev/null | sed 's/ (ignore_errors=[a-z]*)//g' || true)
+            # shellcheck disable=SC2086  # a list of files; /dev/null: never stdin
+            PGS_OTHER=$(grep -shE '^[[:space:]]*OTHER_ARGS=' /dev/null $PGS_ENVF | tail -n 1 || true)
+            if [ -z "$PGS_EXEC" ]; then
+                PG_EXACT="no ExecStart= in proxyguard-server's unit ($PGS_UNIT)"
+            elif [[ $(systemctl show -p ExecStart --value "$PGS" 2>/dev/null || true) == *' -logip '* ]]; then
+                :  # the administrator's own ExecStart (README: Manual setup) has it
+            elif [[ $PGS_EXEC != *OTHER_ARGS* ]]; then
+                # ProxyGuard 2.1.0's unit passes no other arguments: overriding its
+                # ExecStart would break the service if a package update changed it.
+                PG_EXACT="proxyguard-server ${PGS_VER:-?}'s unit takes no other options (2.1.1 does): re-run install.sh after upgrading"
+            elif [ -z "$PGS_OTHER" ]; then
+                PGS_NEW="Environment=OTHER_ARGS=-logip"
+            elif [[ $PGS_OTHER != *-logip* ]]; then
+                PG_EXACT="OTHER_ARGS is set without -logip in $PGS_ENVF"
+                NOTES+=("Add -logip to OTHER_ARGS in $PGS_ENVF, then restart proxyguard-server (open ProxyGuard tunnels drop and reconnect): until then ProxyGuard sources are matched by time.")
+            fi  # else: the administrator set OTHER_ARGS=-logip
+        fi
+    fi
+
     PG_NEW=$(mktemp)
-    cat >"$PG_NEW" <<'APACHE'
-# Installed by eduvpn-logger's install.sh. When a ProxyGuard tunnel opens, Apache
-# logs one line with the client's address (AH10212) to the VirtualHost's ErrorLog;
-# proxyguard-watcher turns it into a tunnel-start event. Only ProxyGuard's own
-# requests (whatever their path) and only mod_proxy's level are raised.
+    echo "# Installed by eduvpn-logger's install.sh, removed by install.sh --uninstall." >"$PG_NEW"
+    if grep -RlsE '^[^#]*proxy:trace[1-8]' /etc/apache2/sites-enabled /etc/apache2/conf-enabled /etc/httpd/conf.d 2>/dev/null \
+        | grep -qv eduvpn-logger-proxyguard; then
+        echo "==> ProxyGuard: Apache already traces tunnel starts"
+    else
+        cat >>"$PG_NEW" <<'APACHE'
+# When a ProxyGuard tunnel opens, Apache logs one line with the client's address
+# (AH10212) to the VirtualHost's ErrorLog; proxyguard-watcher turns it into a
+# tunnel-start event. Only ProxyGuard's own requests (whatever their path) and
+# only mod_proxy's level are raised.
 <IfModule proxy_module>
     <If "%{HTTP:Upgrade} =~ /^UoTLV/i">
         LogLevel proxy:trace1
     </If>
 </IfModule>
 APACHE
-    if grep -RlsE '^[^#]*proxy:trace[1-8]' /etc/apache2/sites-enabled /etc/apache2/conf-enabled /etc/httpd/conf.d 2>/dev/null \
-        | grep -qv eduvpn-logger-proxyguard; then
-        echo "==> ProxyGuard: Apache already traces tunnel starts"
+    fi
+    # An ErrorLogFormat of the administrator's own (server-wide, or a VirtualHost's,
+    # in any .conf of the configuration but the disabled *-available ones; Debian's
+    # *-enabled links followed) stays as it is: the port has to be added by hand.
+    ELF_OWN=$(grep -RlsE --include='*.conf' --exclude-dir='*-available' '^[[:space:]]*ErrorLogFormat[[:space:]]' \
+        /etc/apache2 /etc/httpd 2>/dev/null | grep -v eduvpn-logger-proxyguard | head -n 1 || true)
+    if [ -z "$PG_EXACT" ] && [ -n "$ELF_OWN" ] && ! grep -qs proxy-source-port "$ELF_OWN"; then
+        PG_EXACT="the ErrorLogFormat in $ELF_OWN has no [pgport]"
+        NOTES+=("Add [pgport\\ %8{proxy-source-port}n] right after [client\\ %a] to the ErrorLogFormat in $ELF_OWN, for exact ProxyGuard sources (README: Manual setup).")
+    elif [ -z "$PG_EXACT" ] && [ -z "$ELF_OWN" ]; then
+        # Since 2.4.60 Apache logs the kernel's thread id by default (Linux): same here.
+        TID='%T'
+        AV=$($APACHECTL -v 2>/dev/null | sed -n 's#.*Apache/\([0-9.]*\).*#\1#p' || true)
+        [ "$(printf '%s\n' 2.4.60 "$AV" | sort -V | head -n 1)" != 2.4.60 ] || TID='%{g}T'
+        printf '%s\n' "# Apache's default error log format plus, on trace lines only (%8: the tunnel" \
+            "# start), the local port of Apache's connection to proxyguard-server, which" \
+            "# proxyguard-server -logip ties to the source port WireGuard sees." \
+            'ErrorLogFormat "[%{u}t] [%-m:%l] [pid\ %P% :tid\ '"$TID"'% ] %7F: %E: [client\ %a] [pgport\ %8{proxy-source-port}n] %M% ,\ referer:\ %{Referer}i"' \
+            >>"$PG_NEW"
+    fi
+    if [ "$(wc -l <"$PG_NEW")" -le 1 ]; then
+        # Nothing to add (a trace of the administrator's own, sources by time).
+        if [ -f "$PG_CONF" ]; then
+            if [ "$APACHE_UNIT" = apache2 ]; then a2disconf -q eduvpn-logger-proxyguard >/dev/null 2>&1 || true; fi
+            rm -f "$PG_CONF"
+            if $APACHECTL configtest >/dev/null 2>&1; then systemctl try-reload-or-restart "$APACHE_UNIT.service" || true; fi
+        fi
     elif ! same "$PG_NEW" "$PG_CONF"; then
         PG_OLD=$(mktemp)
         [ ! -f "$PG_CONF" ] || cat "$PG_CONF" >"$PG_OLD"
@@ -332,19 +413,40 @@ APACHE
         [ "$APACHE_UNIT" = apache2 ] && a2enconf -q eduvpn-logger-proxyguard >/dev/null
         if $APACHECTL configtest >/dev/null 2>&1; then
             systemctl try-reload-or-restart "$APACHE_UNIT.service"
-            echo "==> ProxyGuard: Apache traces tunnel starts ($PG_CONF; $APACHE_UNIT reloaded)"
+            echo "==> ProxyGuard: Apache logs tunnel starts ($PG_CONF; $APACHE_UNIT reloaded)"
         elif [ -s "$PG_OLD" ]; then
             cat "$PG_OLD" >"$PG_CONF"  # an upgrade: the version Apache accepted stays
             warn "Apache rejected the new $PG_CONF (configtest failed): the previous one is kept"
+            PG_EXACT="Apache rejected the new $PG_CONF"
         else
             [ "$APACHE_UNIT" = apache2 ] && a2disconf -q eduvpn-logger-proxyguard
             rm -f "$PG_CONF"
             warn "Apache rejected $PG_CONF (configtest failed): removed"
             NOTES+=("Make Apache trace ProxyGuard's requests by hand (README: Manual setup).")
+            PG_EXACT="Apache rejected $PG_CONF"
         fi
         rm -f "$PG_OLD"
     fi
     rm -f "$PG_NEW"
+
+    # The drop-in only while proxyguard-server can use it: an unknown -logip would
+    # keep it from starting (every ProxyGuard client cut off).
+    if [ -z "$PG_EXACT" ] && [ -n "$PGS_NEW" ]; then
+        PGS_TMP=$(mktemp)
+        printf '%s\n' "# Installed by eduvpn-logger's install.sh, removed by install.sh --uninstall:" \
+            "# proxyguard-server logs each tunnel it opens (-logip), for exact ProxyGuard sources." \
+            "[Service]" "$PGS_NEW" >"$PGS_TMP"
+        if ! same "$PGS_TMP" "$PGS_DROPIN"; then
+            install -d "$UNITS/$PGS.d"
+            install -m 0644 "$PGS_TMP" "$PGS_DROPIN"
+            echo "==> ProxyGuard: proxyguard-server logs its tunnels ($PGS_DROPIN)"
+        fi
+        rm -f "$PGS_TMP"
+    elif [ -f "$PGS_DROPIN" ]; then
+        rm -f "$PGS_DROPIN"
+        rmdir --ignore-fail-on-non-empty "$UNITS/$PGS.d"
+        PGS_DROPPED=1  # one that failed to start with it starts again (after daemon-reload)
+    fi
     echo "==> proxyguard-watcher follows $WATCH_LOG"
 fi
 
@@ -460,6 +562,9 @@ if [ -n "$GEO_BIN" ] && grep -qsE '^AccountID[[:space:]]+[1-9]' /etc/GeoIP.conf 
 fi
 
 systemctl daemon-reload
+if [ "${PGS_DROPPED:-0}" = 1 ] && systemctl is-failed --quiet "$PGS"; then
+    systemctl restart "$PGS" || warn "could not restart proxyguard-server"
+fi
 if [ "$GEO_TIMER" -eq 1 ] && ! systemctl enable --now eduvpn-logger-geoipupdate.timer; then
     warn "could not start eduvpn-logger-geoipupdate.timer"
     NOTES+=("Schedule geoipupdate weekly: MaxMind's license requires current data (README: GeoIP).")
@@ -477,6 +582,36 @@ else
     systemctl enable --now eduvpn-logger.service
     if [ -n "$PG_VHOST" ]; then
         systemctl enable --now proxyguard-watcher.service
+    fi
+fi
+
+# proxyguard-server takes -logip when it restarts, which drops the open ProxyGuard
+# tunnels (the apps reconnect at once): asked for, never done unasked.
+pgs_logip() {
+    local pid
+    pid=$(systemctl show -p MainPID --value "$PGS" 2>/dev/null || true)
+    [ "${pid:-0}" != 0 ] && [[ " $(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) " == *" -logip "* ]]
+}
+if [ -n "$PG_VHOST" ] && [ -z "$PG_EXACT" ] && systemctl is-active --quiet "$PGS" && ! pgs_logip; then
+    ANSWER=n
+    if [ -t 0 ]; then
+        read -rp "Restart proxyguard-server now, so that it logs its tunnels? Open ProxyGuard (TCP) tunnels drop and the apps reconnect. [y/N] " ANSWER || ANSWER=n
+    fi
+    if [[ $ANSWER == [yY]* ]]; then
+        systemctl restart "$PGS" || true
+        sleep 2
+        if ! systemctl is-active --quiet "$PGS"; then
+            rm -f "$PGS_DROPIN"
+            rmdir --ignore-fail-on-non-empty "$UNITS/$PGS.d"
+            systemctl daemon-reload
+            systemctl restart "$PGS" || true
+            warn "proxyguard-server did not start with -logip: $PGS_DROPIN removed, started as before"
+            PG_EXACT="proxyguard-server did not start with -logip"
+        fi
+    fi
+    if [ -z "$PG_EXACT" ] && ! pgs_logip; then
+        PG_EXACT="proxyguard-server not restarted yet"
+        NOTES+=("Restart proxyguard-server when convenient, so that it logs its tunnels (open ProxyGuard tunnels drop and the apps reconnect): sudo systemctl restart proxyguard-server. Until then ProxyGuard sources are matched by time.")
     fi
 fi
 
@@ -525,6 +660,11 @@ row WireGuard "$WG_IFS"
 if [ -n "$PG_VHOST" ]; then
     row ProxyGuard "watcher $(systemctl is-active proxyguard-watcher.service || true), following $WATCH_LOG"
     [ -f "$WATCH_LOG" ] || NOTES+=("proxyguard-watcher follows $WATCH_LOG, which does not exist: point it at the ProxyGuard VirtualHost's ErrorLog (README: Manual setup).")
+    if [ -z "$PG_EXACT" ]; then
+        row "PG sources" "exact, by port (proxyguard-server ${PGS_VER:-?} -logip)"
+    else
+        row "PG sources" "by time: $PG_EXACT"
+    fi
 else
     row ProxyGuard "not in use (no VirtualHost proxies it)"
 fi

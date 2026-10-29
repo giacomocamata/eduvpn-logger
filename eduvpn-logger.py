@@ -7,6 +7,8 @@ Merges three independent log sources into one structured line per session event
   * vpn-user-portal (journald)  -> user, profile, WG public key, assigned VPN IPs, bytes
   * WireGuard (`wg show`, polled) -> WG public key <-> public source IP:port; connect/roam/disconnect
   * Apache ProxyGuard (file)    -> public source IP:port for TCP-fallback sessions
+  * proxyguard-server (journald, -logip, ProxyGuard >= 2.1) -> which of those
+    tunnels each WireGuard source port belongs to (exact; by time otherwise)
 
 The WireGuard public key is the correlation key across all three. Connect/roam/
 disconnect events are derived internally by polling `wg show` (no external daemon).
@@ -338,6 +340,8 @@ class TcpStartEvent:
     ts: float
     src_ip: str
     src_port: str
+    # Local port of Apache's connection to proxyguard-server ("" if not logged).
+    pgport: str = ""
 
 
 @dataclass(frozen=True)
@@ -593,6 +597,9 @@ class Correlator:
 
         # Bounded: /proxyguard/ is reachable unauthenticated, so starts can be spammed.
         self._tcp_start_queue: deque[TcpStartEvent] = deque(maxlen=4096)
+        # Apache's port of a connection to proxyguard-server -> (time, IP, port) it is
+        # forwarded to WireGuard from (proxyguard-server -logip), in arrival order.
+        self._pg_proxied: Dict[str, Tuple[float, str, str]] = {}
         self._pubkey_src: Dict[str, Tuple[float, str, str, str]] = {}
         self._pending_connect: Dict[str, Tuple[float, ConnectEvent]] = {}
         self._conn_info: Dict[str, ConnectEvent] = {}
@@ -624,7 +631,7 @@ class Correlator:
         # Keys closed by a portal DISCONNECT since the current `wg show` started.
         self._closed_while_polling: set[str] = set()
         self._warned_portal_format = False
-        self._wg_warned = False
+        self._wg_failed = 0  # failed `wg show` polls in a row
         self._write_warned = False
         # When the sessions were saved (load_state): ProxyGuard starts written
         # since then are read at start.
@@ -667,7 +674,7 @@ class Correlator:
         if _is_loopback(ip):
             if not consume:
                 return "-", "-", "tcp"
-            tcp = self._match_tcp_start(ts, pubkey)
+            tcp = self._match_tcp_start(ts, pubkey, ip, port)
             if tcp is not None:
                 return tcp.src_ip, tcp.src_port, "tcp"
             return "-", "-", "tcp"
@@ -724,7 +731,7 @@ class Correlator:
             f" conn={ev.conn} tunnel_ip4=\"{_san(ev.ip4)}\" tunnel_ip6=\"{_san(ev.ip6)}\" "
             f"src_ip=\"{src_ip}\" src_port={src_port} transport={transport}"
         )
-        msg += self._tcp_candidates_kv(ev.conn, transport)
+        msg += self._tcp_match_kv(ev.conn, transport)
         if not ev.from_portal:
             msg += " inferred=1"
         if country is not None:
@@ -788,7 +795,7 @@ class Correlator:
             f" conn={conn} tunnel_ip4=\"{_san(ip4)}\" tunnel_ip6=\"{_san(ip6)}\" "
             f"src_ip_old=\"{src_ip_old}\" src_port_old={src_port_old} src_ip=\"{src_ip}\" src_port={src_port} transport={transport}"
         )
-        msg += self._tcp_candidates_kv(conn, transport)
+        msg += self._tcp_match_kv(conn, transport)
         if country is not None:
             msg += f" country=\"{country}\""
         if city is not None:
@@ -831,11 +838,14 @@ class Correlator:
             transport=transport,
         )
 
-    def _tcp_candidates_kv(self, pubkey: str, transport: str) -> str:
-        # How many ProxyGuard starts the time match chose from: 1 = unambiguous,
-        # >1 = the closest one was picked (see README "Limitations").
+    def _tcp_match_kv(self, pubkey: str, transport: str) -> str:
+        # How the ProxyGuard source was found: by the tunnel's ports, exact (kept as 0
+        # candidates), or by time, the closest of n starts: 1 = unambiguous, >1 = the
+        # closest one was picked (see README "Limitations").
         n = self._tcp_candidates.get(pubkey)
-        return f" tcp_candidates={n}" if transport == "tcp" and n else ""
+        if transport != "tcp" or n is None:
+            return ""
+        return " tcp_match=port" if n == 0 else f" tcp_match=time tcp_candidates={n}"
 
     @staticmethod
     def _wg_dump() -> Tuple[Dict[str, Tuple[int, int]], Optional[Dict[str, int]], Dict[str, str], bool]:
@@ -897,13 +907,15 @@ class Correlator:
         snap, handshake, endpoint, ok = self._wg_dump()
         if handshake is None:
             # Once per outage, not every poll: without `wg show ... dump` (wg missing,
-            # no CAP_NET_ADMIN, timeout) nothing is derived from WireGuard.
-            if not self._wg_warned:
-                self._wg_warned = True
+            # no CAP_NET_ADMIN, timeout) nothing is derived from WireGuard. From the
+            # second failed poll in a row: stopping the service kills the `wg` it is
+            # running, and that one poll is no outage.
+            self._wg_failed += 1
+            if self._wg_failed == 2:
                 _log_err("wg poller", RuntimeError(
                     "`wg show all dump` failed: no connect/roam/disconnect from WireGuard until it works"))
         else:
-            self._wg_warned = False
+            self._wg_failed = 0
         if not ok:
             # wg show failed this cycle: don't act on absent data (it would synth a
             # disconnect for every live peer), but time-based pruning is always safe.
@@ -1046,7 +1058,7 @@ class Correlator:
                     # No roam line now, but a new ProxyGuard tunnel still claims its
                     # start (or it could be matched to another client) and the next
                     # line must carry the current source (unknown without a start).
-                    tcp = self._match_tcp_start(now, pubkey)
+                    tcp = self._match_tcp_start(now, pubkey, new_ip, new_port)
                     if tcp is not None:
                         self._pubkey_src[pubkey] = (now, tcp.src_ip, tcp.src_port, "tcp")
                     else:
@@ -1112,6 +1124,11 @@ class Correlator:
         cutoff_tcp = now_ts - 120.0
         while self._tcp_start_queue and self._tcp_start_queue[0].ts < cutoff_tcp:
             self._tcp_start_queue.popleft()
+        while self._pg_proxied:
+            oldest = next(iter(self._pg_proxied))
+            if self._pg_proxied[oldest][0] >= cutoff_tcp:
+                break
+            del self._pg_proxied[oldest]
 
         cutoff_src = now_ts - 3600.0
         for pubkey, (ts, _ip, _port, _transport) in list(self._pubkey_src.items()):
@@ -1165,32 +1182,45 @@ class Correlator:
             self._pubkey_src[pubkey] = (held_ts, src_ip, src_port, transport)
         return src_ip, src_port, transport
 
-    def _match_tcp_start(self, now_ts: float, pubkey: str) -> Optional[TcpStartEvent]:
-        # Closest start in time. A start may be stamped slightly *after* the WG
-        # handshake (watcher latency, integer handshake seconds), hence the small
-        # negative tolerance.
-        # ponytail: time proximity is a heuristic; concurrent TCP starts within a few
+    def _match_tcp_start(self, now_ts: float, pubkey: str, wg_ip: Optional[str],
+                         wg_port: Optional[str]) -> Optional[TcpStartEvent]:
+        # The start (client address) of the NEW ProxyGuard tunnel WireGuard sees from
+        # wg_ip:wg_port. Only used to attribute a new tunnel (connect/roam): the match
+        # is consumed. A tunnel carries WireGuard within seconds of opening (a roam is
+        # seen at most one poll later), so older starts are left alone: an unclaimed
+        # one (a tunnel that re-opened twice in a poll, a client whose handshake
+        # fails) is someone else's, and taking it when this client's own start is
+        # missing would report a wrong IP as unambiguous. A start may be stamped
+        # slightly *after* the WG handshake (watcher latency, integer handshake
+        # seconds), hence the small negative tolerance.
+        # By port, exact: proxyguard-server -logip (ProxyGuard >= 2.1) said which Apache
+        # connection it forwards from wg_ip:wg_port, the start which client opened that
+        # connection ([pgport]). A start whose connection is forwarded from elsewhere
+        # is another tunnel's. Otherwise the closest of the remaining starts in time.
+        # ponytail: the time match is a heuristic; concurrent TCP starts within a few
         # seconds can be swapped (see README "Limitations").
-        # Only used to attribute a NEW tunnel (connect/roam): the match is consumed.
-        # A tunnel carries WireGuard within seconds of opening (a roam is seen at most
-        # one poll later), so older starts are left alone: an unclaimed one (a tunnel
-        # that re-opened twice in a poll, a client whose handshake fails) is someone
-        # else's, and taking it when this client's own start is missing would report
-        # a wrong IP as unambiguous.
         max_age = 30.0 + WG_POLL_SEC
         best: Optional[TcpStartEvent] = None
         best_dt = 10_000.0
         candidates = 0
+        exact: Optional[TcpStartEvent] = None
         for ev in reversed(self._tcp_start_queue):
             dt = now_ts - ev.ts
             if dt < -3.0:
                 continue
             if dt > max_age:
                 break
+            fwd = self._pg_proxied.get(ev.pgport) if ev.pgport else None
+            if fwd is not None and abs(fwd[0] - ev.ts) <= 5.0:  # the same tunnel opening
+                if exact is None and fwd[1:] == (wg_ip, wg_port):
+                    exact = ev
+                continue
             candidates += 1
             if abs(dt) < best_dt:
                 best = ev
                 best_dt = abs(dt)
+        if exact is not None:
+            best, candidates = exact, 0  # 0 candidates by time: found by port
         if best is not None:
             # One ProxyGuard tunnel maps to exactly one peer: claim it so a second
             # peer can't be matched to the same src ip:port.
@@ -1209,14 +1239,24 @@ class Correlator:
                 "VirtualHost that proxies ProxyGuard, with Apache tracing it? (README: Manual setup)"))
         return best
 
-    def on_tcp_start(self, ts: float, src_ip: str, src_port: str) -> None:
+    def on_tcp_start(self, ts: float, src_ip: str, src_port: str, pgport: str = "") -> None:
         # Old starts are dropped by the poll's prune (and the deque is bounded): the
         # state is scanned once per poll, never per event, so a flood of tunnel
         # starts (/proxyguard/ needs no login) costs O(1) each.
         with self._lock:
-            self._tcp_start_queue.append(TcpStartEvent(ts=ts, src_ip=src_ip, src_port=src_port))
+            self._tcp_start_queue.append(TcpStartEvent(ts=ts, src_ip=src_ip, src_port=src_port, pgport=pgport))
             self._last_tcp_start = time.time()
             self._tcp_warned = False
+
+    def on_pg_proxied(self, ts: float, apache_port: str, wg_ip: str, wg_port: str) -> None:
+        # proxyguard-server forwards Apache's connection from apache_port as
+        # wg_ip:wg_port. A reused port moves to the end, so the poll's prune drops the
+        # oldest first; bounded like the starts (any client can open tunnels).
+        with self._lock:
+            self._pg_proxied.pop(apache_port, None)
+            self._pg_proxied[apache_port] = (ts, wg_ip, wg_port)
+            if len(self._pg_proxied) > 4096:
+                del self._pg_proxied[next(iter(self._pg_proxied))]
 
     def _handle_wg_event_locked(self, ts: float, message: str) -> None:
         # Parses a "connected from / roamed to / disconnected from" WireGuard event
@@ -1235,7 +1275,7 @@ class Correlator:
                 if cur is not None and cur[3] == "tcp" and cur[1] != "-":
                     pass  # already attributed (portal path): another start would be someone else's
                 else:
-                    tcp = self._match_tcp_start(ts, pubkey)
+                    tcp = self._match_tcp_start(ts, pubkey, ip, port)
                 if tcp is not None:
                     self._pubkey_src[pubkey] = (ts, tcp.src_ip, tcp.src_port, "tcp")
                 elif cur is None or cur[1] == "-":
@@ -1289,7 +1329,7 @@ class Correlator:
 
             if _is_loopback(ip):
                 transport = "tcp"
-                tcp = self._match_tcp_start(ts, pubkey)
+                tcp = self._match_tcp_start(ts, pubkey, ip, port)
                 if tcp is not None:
                     ip = tcp.src_ip
                     port = tcp.src_port
@@ -1492,7 +1532,8 @@ class Correlator:
                 } for k in self._emitted_connect_ts},
                 "pending": {k: [ts, asdict(ev)] for k, (ts, ev) in self._pending_connect.items()},
                 "silence_closed": {k: asdict(who) for k, (_seen, who) in self._silence_closed.items()},
-                "tcp_starts": [[e.ts, e.src_ip, e.src_port] for e in self._tcp_start_queue],
+                "tcp_starts": [[e.ts, e.src_ip, e.src_port, e.pgport] for e in self._tcp_start_queue],
+                "pg_proxied": self._pg_proxied,
                 "stopped": time.time(),  # the starts read so far: the ones after come at start
             }
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -1511,7 +1552,8 @@ class Correlator:
         now = time.time()
         maps = (self._emitted_connect_ts, self._conn_info, self._pubkey_src, self._virtual_peers,
                 self._peer_last_handshake, self._wg_bytes_baseline, self._wg_bytes_last, self._roam_last,
-                self._roam_owed, self._tcp_candidates, self._pending_connect, self._silence_closed)
+                self._roam_owed, self._tcp_candidates, self._pending_connect, self._silence_closed,
+                self._pg_proxied)
         # Every value converted to its type: a malformed file is rejected here, whole,
         # instead of breaking every poll after it.
         def event(d: dict) -> ConnectEvent:
@@ -1545,8 +1587,11 @@ class Correlator:
             for k, who in data["silence_closed"].items():
                 # From now: its late portal DISCONNECT is still an echo.
                 self._silence_closed[k] = (now, event(who) if who else None)
-            for ts, ip, port in data["tcp_starts"]:
-                self._tcp_start_queue.append(TcpStartEvent(ts=float(ts), src_ip=str(ip), src_port=str(port)))
+            for ts, ip, port, *pgport in data["tcp_starts"]:  # no pgport: saved by an earlier release
+                self._tcp_start_queue.append(TcpStartEvent(ts=float(ts), src_ip=str(ip), src_port=str(port),
+                                                           pgport=str(pgport[0]) if pgport else ""))
+            for a, (ts, ip, port) in data.get("pg_proxied", {}).items():
+                self._pg_proxied[str(a)] = (float(ts), str(ip), str(port))
             self.stopped_at = float(data.get("stopped", 0.0))  # 0: saved by a release without it
         except Exception as e:
             for d in maps:
@@ -1580,6 +1625,37 @@ def _trusted_portal_entry(entry: dict, uid_max: int) -> bool:
     return isinstance(uid, str) and uid.isdigit() and int(uid) <= uid_max
 
 
+def _trusted_proxyguard_entry(entry: dict) -> bool:
+    # proxyguard-server runs as a DynamicUser: no fixed UID to check. _SYSTEMD_UNIT,
+    # stamped by journald from the sender's cgroup (the sender cannot set it), names
+    # its service, and only root creates system services: `logger -t
+    # proxyguard-server` from a login, a cron job or a user unit is in another unit.
+    # Other instances, if any, are units named after it.
+    unit = entry.get("_SYSTEMD_UNIT")
+    return isinstance(unit, str) and unit.startswith("proxyguard-server") and unit.endswith(".service")
+
+
+_PORT_RE = re.compile(r"[0-9]{1,5}")
+# proxyguard-server -logip (ProxyGuard >= 2.1), as it opens a tunnel:
+#   "2026/10/28 18:24:22 [Server] 127.0.0.1:45442 proxied as 127.0.0.1:46312"
+# = Apache's end of the connection it serves, and the source WireGuard sees.
+# The whole line: its error lines quote what a client sent (a header), which
+# could hold such a text.
+_PG_PROXIED_RE = re.compile(r"\d{4}/\d\d/\d\d \d\d:\d\d:\d\d \[Server\] (\S+) proxied as (\S+)")
+
+
+def _parse_proxyguard_proxied(message: str) -> Optional[Tuple[str, str, str]]:
+    # (Apache's port, WireGuard source IP, WireGuard source port), or None.
+    m = _PG_PROXIED_RE.fullmatch(message.rstrip("\n"))
+    if m is None:
+        return None
+    (a_ip, a_port), (b_ip, b_port) = _split_endpoint(m.group(1)), _split_endpoint(m.group(2))
+    if (a_ip and b_ip and a_port and b_port and _is_ip(a_ip) and _is_ip(b_ip)
+            and _PORT_RE.fullmatch(a_port) and _PORT_RE.fullmatch(b_port)):
+        return a_port, b_ip, b_port
+    return None
+
+
 _CURSOR_RE = re.compile(r"[\x21-\x7e]+")
 
 
@@ -1607,12 +1683,14 @@ def _save_cursor(cursor: str) -> None:
 
 
 def _portal_journal_cmd(cursor: Optional[str], follow: bool = True) -> list[str]:
-    # Resume right after the last processed entry, so portal events logged while
-    # the daemon was down are not lost; with no cursor, start from "now". Not with
+    # The portal's events and proxyguard-server's tunnels, from one position.
+    # Resume right after the last processed entry, so what was logged while the
+    # daemon was down is not lost; with no cursor, start from "now". Not with
     # `-n 0`: combined with `-t`, journalctl -f of systemd 252 (EL 9) misses the
-    # entries of other users (the portal runs as www-data/apache) until the journal
-    # already holds one with that identifier.
-    cmd = ["journalctl"] + (["-f"] if follow else []) + ["-o", "json", "-t", "vpn-user-portal", "--no-pager"]
+    # entries of other users (the portal runs as www-data/apache, proxyguard-server
+    # as a DynamicUser) until the journal already holds one with that identifier.
+    cmd = ["journalctl"] + (["-f"] if follow else []) + [
+        "-o", "json", "-t", "vpn-user-portal", "-t", "proxyguard-server", "--no-pager"]
     return cmd + ([f"--after-cursor={cursor}"] if cursor else ["--since", "now"])
 
 
@@ -1627,6 +1705,7 @@ def _reader_journal(q: "queue.Queue[Tuple[str, float, Optional[str], Optional[st
     uid_max = _sys_uid_max()
     cursor = _load_cursor()
     rejected_uids: set[str] = set()
+    rejected_units: set[str] = set()
     failing = False  # warn once per outage, not once a second
     follow = cursor is None
     if follow:
@@ -1665,7 +1744,22 @@ def _reader_journal(q: "queue.Queue[Tuple[str, float, Optional[str], Optional[st
                         msg = None
                 if not isinstance(msg, str) or not msg:
                     msg = None
-                elif not _trusted_portal_entry(entry, uid_max):
+                if entry.get("SYSLOG_IDENTIFIER") == "proxyguard-server":
+                    # Only its "proxied as" lines, from the service itself. The rest
+                    # moves the position on without a write each: anyone can make
+                    # proxyguard-server log an error.
+                    if msg is not None and not _trusted_proxyguard_entry(entry):
+                        unit = str(entry.get("_SYSTEMD_UNIT"))
+                        if unit not in rejected_units:
+                            rejected_units.add(unit)
+                            _log_err("proxyguard", PermissionError(
+                                f"ignoring proxyguard-server entries from unit {unit} (possible spoofing)"))
+                    elif msg is not None:
+                        proxied = _parse_proxyguard_proxied(msg)
+                        if proxied is not None:
+                            q.put(("proxyguard_proxied", ts, " ".join(proxied), cursor))
+                    continue
+                if msg is not None and not _trusted_portal_entry(entry, uid_max):
                     uid = str(entry.get("_UID"))
                     if uid not in rejected_uids:
                         rejected_uids.add(uid)
@@ -1726,8 +1820,8 @@ def _reader_proxyguard_start(q: "queue.Queue[Tuple[str, float, Optional[str], Op
     # Tunnels opened while the daemon was stopped (restart, upgrade, reboot) have
     # their start read first, or each would get no source, or another's.
     try:
-        for ts, src_ip, src_port in _proxyguard_backlog(after) if after else ():
-            q.put(("proxyguard_start", ts, f"{src_ip} {src_port}", None))
+        for ts, src_ip, src_port, pgport in _proxyguard_backlog(after) if after else ():
+            q.put(("proxyguard_start", ts, f"{src_ip} {src_port} {pgport or '-'}", None))
     except Exception as e:  # never the end of this thread: the starts after still count
         _log_err("proxyguard reader", e)
     cmd = ["tail", "-n", "0", "-F", PROXYGUARD_START_LOG]
@@ -1743,8 +1837,8 @@ def _reader_proxyguard_start(q: "queue.Queue[Tuple[str, float, Optional[str], Op
                 parsed = _parse_proxyguard_start_line(line)
                 if parsed is None:
                     continue
-                ts, src_ip, src_port = parsed
-                q.put(("proxyguard_start", ts, f"{src_ip} {src_port}", None))
+                ts, src_ip, src_port, pgport = parsed
+                q.put(("proxyguard_start", ts, f"{src_ip} {src_port} {pgport or '-'}", None))
         except Exception as e:
             _log_err("proxyguard reader", e)
         finally:
@@ -1854,7 +1948,8 @@ class GeoIp:
         return self._name(rec.get("country")), self._name(rec.get("city"))
 
 
-def _parse_proxyguard_start_line(line: str) -> Optional[Tuple[float, str, str]]:
+def _parse_proxyguard_start_line(line: str) -> Optional[Tuple[float, str, str, str]]:
+    # (time, client IP, client port, Apache's port towards proxyguard-server or "").
     parts = line.split()
     if not parts:
         return None
@@ -1865,13 +1960,15 @@ def _parse_proxyguard_start_line(line: str) -> Optional[Tuple[float, str, str]]:
     # Copied into the log lines: an address and a port number, nothing else.
     src_ip = kv.get("src_ip", "")
     src_port = kv.get("src_port", "-")
-    if not _is_ip(src_ip) or not (src_port == "-" or re.fullmatch(r"[0-9]{1,5}", src_port)):
+    pgport = kv.get("pgport", "")
+    if (not _is_ip(src_ip) or not (src_port == "-" or _PORT_RE.fullmatch(src_port))
+            or not (pgport == "" or _PORT_RE.fullmatch(pgport))):
         return None
     try:
         ts = datetime.fromisoformat(ts_raw).timestamp()
     except Exception:
         ts = time.time()
-    return ts, src_ip, src_port
+    return ts, src_ip, src_port, pgport
 
 
 def _split_endpoint(endpoint: str) -> Tuple[Optional[str], Optional[str]]:
@@ -1933,8 +2030,11 @@ def main() -> None:
                 if msg is not None:
                     corr.on_portal(ts, msg)
             elif source == "proxyguard_start" and msg is not None:
-                src_ip, src_port = msg.split(" ", 1)
-                corr.on_tcp_start(ts, src_ip, src_port)
+                src_ip, src_port, pgport = msg.split(" ")
+                corr.on_tcp_start(ts, src_ip, src_port, "" if pgport == "-" else pgport)
+            elif source == "proxyguard_proxied" and msg is not None:
+                apache_port, wg_ip, wg_port = msg.split(" ")
+                corr.on_pg_proxied(ts, apache_port, wg_ip, wg_port)
             elif source == "caught_up":
                 _CAUGHT_UP.set()
         except Exception as e:
