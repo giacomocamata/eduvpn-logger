@@ -50,7 +50,7 @@ sospensione (public key abbreviate).*
   compilare, nessuna patch a eduVPN, nessun modulo del kernel.
 - **Pronto con un comando** su ogni sistema supportato da eduVPN 3: attiva in
   eduVPN quello che gli serve, verifica ogni modifica e controlla il risultato.
-- **In produzione** all'Università di Trieste.
+- **In produzione** all'Università di Trieste (una release precedente).
 
 ## Indice
 
@@ -111,8 +111,8 @@ ricostruisce i collegamenti mancanti, in tempo reale.
   abbinamento ambiguo si riconosce come tale.
 - **L'identità dalla fonte autorevole.** Utente e profilo arrivano dal
   portale: dalla riga del suo database per la public key della sessione
-  (aperto in sola lettura, con lo schema riconosciuto a runtime), altrimenti
-  dal suo evento CONNECT. Il portale scrive gli identificativi utente nelle
+  (aperto in sola lettura), altrimenti dal suo evento CONNECT. Il portale
+  scrive gli identificativi utente nelle
   righe di log così come sono, quindi una riga in cui un identificativo imita
   il template (per farsi passare per un altro utente, o per la chiave di
   un'altra sessione) viene scartata, mai letta male.
@@ -158,7 +158,7 @@ flowchart LR
         pgs["proxyguard-server"] -->|"porte dei tunnel (-logip)"| journal
         wg["WireGuard wg0"]
         journal --> logger{{"eduvpn-logger"}}
-        db -.->|"in mancanza dell'evento"| logger
+        db -->|"utente per public key"| logger
         wg -->|"wg show ogni 2 s"| logger
         watcher -->|"proxyguard_start.log"| logger
         logger --> file["/var/log/eduvpn/eduvpn.log"]
@@ -171,7 +171,7 @@ Il daemon legge queste sorgenti e le unisce sulla **public key WireGuard**:
 | Sorgente | Cosa fornisce | Come viene letta |
 |---|---|---|
 | eventi del portale | utente, profilo, public key, IP del tunnel, traffico | journald, `SYSLOG_IDENTIFIER=vpn-user-portal`, dalla posizione salvata |
-| database del portale | utente, profilo, IP del tunnel e app di una public key | `/var/lib/vpn-user-portal/db.sqlite`, tabella `wg_peers`, sola lettura, quando manca un evento |
+| database del portale | utente, profilo, IP del tunnel e app di una public key | `/var/lib/vpn-user-portal/db.sqlite`, tabella `wg_peers`, sola lettura, a ogni CONNECT e per i peer senza evento del portale |
 | WireGuard | endpoint (`IP:porta` pubblici), ultimo handshake, traffico di ogni peer | `wg show all dump`, ogni 2 s |
 | ProxyGuard *(opzionale)* | `IP:porta` reali del client di ogni tunnel TCP, alla sua apertura, e la porta della connessione di Apache verso proxyguard-server | `ErrorLog` di Apache → `proxyguard-watcher` → `proxyguard_start.log` |
 | proxyguard-server *(ProxyGuard 2.1+)* | la porta di provenienza che WireGuard vede per ogni connessione di Apache | journald, `SYSLOG_IDENTIFIER=proxyguard-server`, con `-logip` |
@@ -525,9 +525,12 @@ ExecStart=
 ExecStart=/usr/sbin/proxyguard-server -listen ${LISTEN} -to ${TO} -logip
 ```
 
-Togli questo drop-in quando arriva la 2.1.1, poi riesegui `install.sh`. In
-entrambi i casi, in un momento tranquillo, visto che i tunnel ProxyGuard
-aperti cadono e le app si riconnettono:
+Togli questo drop-in quando arriva la 2.1.1 (poi riesegui `install.sh`) e
+prima di riportare proxyguard-server sotto la 2.1, che non parte con `-logip`.
+
+Per applicare l'una o l'altra impostazione riavvia proxyguard-server in un
+momento tranquillo, visto che i tunnel ProxyGuard aperti cadono e le app si
+riconnettono:
 
 ```bash
 sudo systemctl restart proxyguard-server
@@ -579,7 +582,7 @@ sudo systemctl restart eduvpn-logger.service
 |---|---|---|
 | `EDUVPN_LOG` | `/var/log/eduvpn/eduvpn.log` | file di output |
 | `EDUVPN_PORTAL_DB` | `/var/lib/vpn-user-portal/db.sqlite` | database del portale (sola lettura) |
-| `EDUVPN_PROXYGUARD_START_LOG` | `/var/log/apache2/proxyguard_start.log` (`/var/log/httpd/…` su EL/Fedora) | file scritto da `proxyguard-watcher` |
+| `EDUVPN_PROXYGUARD_START_LOG` | `/var/log/apache2/proxyguard_start.log` (`/var/log/httpd/…` su EL/Fedora) | file scritto da `proxyguard-watcher`: da impostare anche per `proxyguard-watcher.service` |
 | `EDUVPN_STATE_DIR` | `/var/lib/eduvpn-logger` | posizione nel journal; sessioni aperte mentre il servizio è fermo |
 | `EDUVPN_GEOIP_DB` | *(cercato)* | percorso di `GeoLite2-City.mmdb`; per default cercato in `/usr/local/share/GeoIP`, `/usr/share/GeoIP` e `/var/lib/GeoIP` |
 | `EDUVPN_GEOIP_LANG` | `en` | lingua/e dei nomi dei luoghi, vale la prima disponibile, es. `it,en` |
@@ -592,10 +595,13 @@ sudo systemctl restart eduvpn-logger.service
 | `EDUVPN_WG_INTERFACES` | *(tutte)* | interfacce WireGuard da seguire, separate da virgola, es. `wg0`; da impostare se il server ha altri tunnel WireGuard |
 
 Per provare impostazioni senza toccare il servizio, avvia una seconda istanza
-con output e directory di stato propri:
+con output e directory di stato propri, in una directory nuova che solo root
+può usare (non un nome fisso sotto `/tmp`, che un altro utente potrebbe creare
+prima):
 
 ```bash
-sudo EDUVPN_LOG=/tmp/test.log EDUVPN_STATE_DIR=/tmp/eduvpn-test EDUVPN_SYSLOG_IDENT=eduvpn-logger-test /usr/local/sbin/eduvpn-logger.py
+T=$(sudo mktemp -d)
+sudo EDUVPN_LOG=$T/test.log EDUVPN_STATE_DIR=$T EDUVPN_SYSLOG_IDENT=eduvpn-logger-test /usr/local/sbin/eduvpn-logger.py
 ```
 
 ### Inviare gli eventi a un SIEM
@@ -799,13 +805,12 @@ annunciate di nuovo una volta (`inferred=1`), come dopo un crash.
 
 Dopo aver aggiornato proxyguard-server dalla 2.1.0 o precedente alla 2.1.1 o
 successiva, riesegui `install.sh` una volta: solo allora le sorgenti ProxyGuard
-sono esatte. Gli aggiornamenti successivi non richiedono nulla: il drop-in
-imposta solo `OTHER_ARGS`. Prima di riportare proxyguard-server sotto la 2.1, togli il drop-in
-(`/etc/systemd/system/proxyguard-server.service.d/eduvpn-logger.conf`, poi
-`sudo systemctl daemon-reload`): un proxyguard-server precedente non parte con
-`-logip`. Per tornare a una versione precedente di eduvpn-logger, esegui prima
-`install.sh --uninstall` di questa: un `proxyguard-watcher` precedente non legge
-le aperture dei tunnel con `[pgport]`.
+sono esatte. Gli aggiornamenti successivi, e un ritorno a una versione
+precedente, non richiedono nulla: il drop-in imposta solo `OTHER_ARGS`, che una
+unit precedente non usa (rieseguendo `install.sh` viene tolto). Per tornare a
+una versione precedente di eduvpn-logger, esegui prima `install.sh --uninstall`
+di questa: un `proxyguard-watcher` precedente non legge le aperture dei tunnel
+con `[pgport]`.
 
 Rimozione:
 
@@ -875,8 +880,9 @@ eduvpn-logger nasce da una prima versione costruita su
 (INFN), che ha mostrato come ricavare dallo stato di WireGuard gli eventi di
 connect, roam e disconnect associando ogni endpoint alla public key del suo
 peer. Leggere la stessa associazione direttamente da `wg show` è ciò che ha
-reso questo daemon autosufficiente. Il suo `-logip`, in ProxyGuard 2.1, è ciò
-che rende esatto l'abbinamento ProxyGuard.
+reso questo daemon autosufficiente. L'opzione `-logip` di ProxyGuard 2.1, che
+ha scritto insieme a Jeroen Wijenbergh (GÉANT), è ciò che rende esatto
+l'abbinamento ProxyGuard.
 
 ## Licenza
 

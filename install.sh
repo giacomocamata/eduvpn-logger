@@ -114,7 +114,8 @@ if [ -n "$PKG" ]; then
     for p in wireguard-tools python3 logrotate; do
         if missing "$p"; then $PKG "$p"; fi
     done
-    for p in python3-maxminddb geoipupdate; do
+    # geoipupdate only with a MaxMind account to use it with (see GeoIP below).
+    for p in python3-maxminddb ${GEOIP_ACCOUNT_ID:+geoipupdate}; do
         if missing "$p"; then $PKG "$p" || warn "optional package $p not installed (GeoIP only)"; fi
     done
 fi
@@ -259,9 +260,11 @@ portal_log_state() {
 enable_portal_log() {
     local new="$PORTAL_CONF.eduvpn-logger.new"
     python3 - "$PORTAL_CONF" "$new" <<'PY' || { rm -f "$new"; return 1; }
+import os
 import re
 import sys
 
+os.umask(0o077)  # the copy is root's only: config.php may hold passwords (database, LDAP)
 src, dst = sys.argv[1], sys.argv[2]
 s = open(src, encoding="utf-8").read()
 t = ("'connectLogTemplate' => 'CONNECT USER={{USER_ID}} PROFILE={{PROFILE_ID}} PROTO={{VPN_PROTO}} CONN={{CONNECTION_ID}} IP4={{IP_FOUR}} IP6={{IP_SIX}}',",
@@ -364,8 +367,10 @@ if [ -n "$PG_VHOST" ]; then
 
     PG_NEW=$(mktemp)
     echo "# Installed by eduvpn-logger's install.sh, removed by install.sh --uninstall." >"$PG_NEW"
-    if grep -RlsE '^[^#]*proxy:trace[1-8]' /etc/apache2/sites-enabled /etc/apache2/conf-enabled /etc/httpd/conf.d 2>/dev/null \
-        | grep -qv eduvpn-logger-proxyguard; then
+    # A trace of the administrator's own counts only in the VirtualHost that proxies
+    # ProxyGuard: one elsewhere (another site) may not cover its requests, and ours,
+    # limited to ProxyGuard's requests, is harmless next to one that does.
+    if grep -qsE '^[^#]*proxy:trace[1-8]' "$PG_VHOST"; then
         echo "==> ProxyGuard: Apache already traces tunnel starts"
     else
         cat >>"$PG_NEW" <<'APACHE'
@@ -509,13 +514,16 @@ if [ -n "${GEOIP_ACCOUNT_ID:-}" ] && [ -n "${GEOIP_LICENSE_KEY:-}" ]; then
             # in the file stay, GeoLite2-City is added if missing.
             echo "==> GeoIP: /etc/GeoIP.conf updated (MaxMind account, GeoLite2-City)"
             chmod 600 /etc/GeoIP.conf  # before the new key is in it
-            python3 - "$GEOIP_ACCOUNT_ID" "$GEOIP_LICENSE_KEY" <<'PY'
+            # The key in the environment, not on the command line: any local user
+            # can read a process's arguments (ps), only root its environment.
+            GEOIP_LICENSE_KEY="$GEOIP_LICENSE_KEY" python3 - "$GEOIP_ACCOUNT_ID" <<'PY'
+import os
 import re
 import sys
 
 p = "/etc/GeoIP.conf"
 s = open(p, encoding="utf-8").read()
-for key, value in (("AccountID", sys.argv[1]), ("LicenseKey", sys.argv[2])):
+for key, value in (("AccountID", sys.argv[1]), ("LicenseKey", os.environ["GEOIP_LICENSE_KEY"])):
     s, n = re.subn(rf"(?m)^{key}\s.*$", lambda m: f"{key} {value}", s)
     s += "" if n else f"{key} {value}\n"
 if not re.search(r"(?m)^EditionIDs\s.*\bGeoLite2-City\b", s):
@@ -630,8 +638,8 @@ if [ -f "$PORTAL_CONF" ] && command -v php >/dev/null 2>&1; then
         *) row "portal log" "unreadable" ;;
     esac
 fi
-# The portal DB is read (as a fallback) only when it is SQLite: eduVPN can also use
-# PostgreSQL or MariaDB. Only the driver is shown: the DSN may hold a password.
+# The portal DB is read only when it is SQLite: eduVPN can also use PostgreSQL or
+# MariaDB. Only the driver is shown: the DSN may hold a password.
 DB_KIND=""
 if [ -f "$PORTAL_CONF" ] && command -v php >/dev/null 2>&1; then
     DB_KIND=$(php -r '$c = require $argv[1]; echo strtok((is_array($c) && isset($c["Db"]["dbDsn"])) ? (string) $c["Db"]["dbDsn"] : "", ":");' \
@@ -668,8 +676,13 @@ if [ -n "$PG_VHOST" ]; then
 else
     row ProxyGuard "not in use (no VirtualHost proxies it)"
 fi
-GEO=$(geo_db)
-if [ -z "$GEO" ] && grep -qsE '^AccountID[[:space:]]+[1-9]' /etc/GeoIP.conf; then
+# The database the daemon uses: the one EDUVPN_GEOIP_DB names, else the first found.
+GEO_SET=$(tr ' ' '\n' <<<"$UNIT_ENV" | sed -n 's/^EDUVPN_GEOIP_DB=//p' | tail -n 1 || true)
+GEO=${GEO_SET:-$(geo_db)}
+if [ -n "$GEO_SET" ] && [ ! -f "$GEO_SET" ]; then
+    row GeoIP "off: EDUVPN_GEOIP_DB=$GEO_SET not found"
+    NOTES+=("GeoIP: EDUVPN_GEOIP_DB names $GEO_SET, which does not exist (README: Configuration).")
+elif [ -z "$GEO" ] && grep -qsE '^AccountID[[:space:]]+[1-9]' /etc/GeoIP.conf; then
     row GeoIP "off: no database downloaded yet"
     NOTES+=("GeoIP: GeoLite2-City could not be downloaded: check the account and license key in /etc/GeoIP.conf and the server's access to MaxMind, then re-run install.sh (README: GeoIP).")
 elif [ -z "$GEO" ]; then

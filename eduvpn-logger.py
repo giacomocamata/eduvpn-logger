@@ -293,29 +293,6 @@ def _parse_wg_dump_output(
     return snap, handshake, endpoint
 
 
-def _parse_wg_transfer_output(text: str) -> Dict[str, Tuple[int, int]]:
-    # `wg show all transfer`: one tab-separated line per peer:
-    #   <iface> <pubkey> <rx> <tx>
-    snap: Dict[str, Tuple[int, int]] = {}
-    for line in text.splitlines():
-        parts = line.split("\t")
-        if len(parts) != 4 or (WG_INTERFACES and parts[0] not in WG_INTERFACES):
-            continue
-        pubkey = parts[1].strip()
-        try:
-            rx = int(parts[2].strip())
-            tx = int(parts[3].strip())
-        except Exception:
-            continue
-        if pubkey:
-            snap[pubkey] = (rx, tx)
-    return snap
-
-
-WG_CONNECTED_PREFIX = " connected from "
-WG_DISCONNECTED_PREFIX = " disconnected from "
-WG_ROAMED_PREFIX = " roamed to "
-
 # Emit a disconnect after this many seconds of handshake silence. Overridable via env,
 # but never below 180 s: WireGuard drops a session's keys 180 s after its handshake
 # (REJECT_AFTER_TIME) and a tunnel carrying traffic re-handshakes before that (every
@@ -323,9 +300,8 @@ WG_ROAMED_PREFIX = " roamed to "
 _DISCONNECT_AFTER_ENV = _env_float("EDUVPN_DISCONNECT_AFTER_SEC", 180.0)
 SYNTH_DISCONNECT_AFTER_SEC = max(180.0, _DISCONNECT_AFTER_ENV)
 # A peer is "active" while its last WireGuard handshake is within this window.
-# Capped at the disconnect threshold: a peer already past that threshold must never
-# count as active again, or lowering EDUVPN_DISCONNECT_AFTER_SEC below 180 would
-# make idle-but-alive peers flap (synth disconnect -> still "active" -> re-connect).
+# Never above the disconnect threshold (also if its 180 s floor is ever lowered): a
+# peer past it would count as active again and flap (disconnect -> re-connect).
 ACTIVE_HANDSHAKE_MAX_AGE_SEC = min(180.0, SYNTH_DISCONNECT_AFTER_SEC)
 # Defer a synthesized connect this long so the portal event / DB row can attribute it
 # to a user before we emit; we emit early as soon as it resolves. Overridable via env.
@@ -368,187 +344,63 @@ class DbConnInfo:
     profile: str
     ip4: str
     ip6: str
-    display_name: str
-    client_id: str
+    display_name: str  # for a session made by an app: its OAuth client ID
 
 
 class PortalDb:
+    # eduVPN 3's WireGuard configurations by public key: the same columns in every
+    # schema of vpn-user-portal 3 (schema/, 2022 on).
+    _QUERY = "SELECT user_id, profile_id, ip_four, ip_six, display_name FROM wg_peers WHERE public_key = ?"
+
     def __init__(self, db_path: str = DB_PATH) -> None:
         self._db_path = db_path
         # Read-only; the path quoted, as a URI needs ("?" or "#" would cut it).
         self._uri = f"file:{urllib.parse.quote(db_path)}?mode=ro"
-        self._conn: Optional["sqlite3.Connection"] = None
-        self._query: Optional[str] = None
-        self._col_user: Optional[str] = None
-        self._col_profile: Optional[str] = None
-        self._col_ip4: Optional[str] = None
-        self._col_ip6: Optional[str] = None
-        self._col_display_name: Optional[str] = None
-        self._col_client_id: Optional[str] = None
+        self._ok = False
         self._retry_at = 0.0
         self._warned = False
         self._lookup_warned = False
-        self._detect()
+        self._check()
 
-    def _detect(self) -> None:
-        # Schema detection runs on a temporary connection. Lookups then use a fresh
-        # short-lived connection each time, so rows the portal commits after startup
-        # are always visible (a long-lived reader can miss them). Until it succeeds
-        # it is retried at most once a minute from lookup(): the DB may not exist
-        # yet at boot, or its schema may change with a portal upgrade.
-        self._retry_at = time.time() + 60.0
+    def _query_one(self, public_key: str) -> Optional[tuple]:
+        # A fresh short-lived connection each time, so rows the portal commits later
+        # are always visible (a long-lived reader can miss them). Read-only with a 1 s
+        # timeout (no write lock, WAL-safe): called while the correlator's lock is held.
+        conn = sqlite3.connect(self._uri, uri=True, timeout=1.0)
         try:
-            if not os.path.exists(self._db_path):
-                return
-            self._conn = sqlite3.connect(self._uri, uri=True, timeout=1.0)
-            self._conn.row_factory = sqlite3.Row
-            self._detect_schema()
-        except Exception:
-            self._query = None
+            return conn.execute(self._QUERY, (public_key,)).fetchone()
         finally:
-            if self._query is None and not self._warned:
-                self._warned = True
-                _log_err("portal db", RuntimeError(
-                    f"no usable session table in {self._db_path}; connects without a portal "
-                    "event get user=- until it appears (retried every minute)"))
-            if self._conn is not None:
-                try:
-                    self._conn.close()
-                except Exception:
-                    pass
-                self._conn = None
+            conn.close()
 
-    def _detect_schema(self) -> None:
-        assert self._conn is not None
-
-        tables = []
+    def _check(self) -> None:
+        # Until the table is there it is looked for at most once a minute, from
+        # lookup(): the DB may not exist yet at boot, or a portal upgrade may change it.
+        self._retry_at = time.time() + 60.0
+        self._ok = False
         try:
-            rows = self._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            ).fetchall()
-            tables = [str(r[0]) for r in rows if r and r[0]]
+            if os.path.exists(self._db_path):
+                self._query_one("")  # fails if the table or one of its columns is missing
+                self._ok = True
         except Exception:
-            return
-
-        best = None
-        best_score = -1
-        best_cols: Dict[str, str] = {}
-        best_order = None
-
-        # Correlation is ALWAYS by WireGuard public key, so prefer pubkey-named
-        # columns over a generic "connection_id" — otherwise a portal DB with an
-        # unrelated connection_id+user+profile table could bind the WHERE to the
-        # wrong column and silently make every lookup miss (user=-).
-        conn_candidates = [
-            "public_key",
-            "wg_public_key",
-            "wireguard_public_key",
-            "wireguard_pubkey",
-            "connection_id",
-            "conn",
-        ]
-        user_candidates = ["user_id", "user"]
-        profile_candidates = ["profile_id", "profile"]
-        ip4_candidates = ["ip_four", "ip4", "ip_f", "ip_v4"]
-        ip6_candidates = ["ip_six", "ip6", "ip_v6"]
-        display_name_candidates = ["display_name", "device_name", "name"]
-        client_id_candidates = ["oauth_client_id", "client_id", "vpn_client_id", "api_client_id"]
-        order_candidates = ["created_at", "issued_at", "updated_at", "id"]
-
-        for t in tables:
-            try:
-                col_rows = self._conn.execute(f'PRAGMA table_info("{t}")').fetchall()
-            except Exception:
-                continue
-            cols = [str(r[1]).lower() for r in col_rows if r and r[1]]
-            col_set = set(cols)
-
-            def pick(cands: list[str]) -> Optional[str]:
-                for c in cands:
-                    if c in col_set:
-                        return c
-                return None
-
-            c_conn = pick(conn_candidates)
-            c_user = pick(user_candidates)
-            c_profile = pick(profile_candidates)
-            c_ip4 = pick(ip4_candidates)
-            c_ip6 = pick(ip6_candidates)
-            c_display_name = pick(display_name_candidates)
-            c_client_id = pick(client_id_candidates)
-            if c_conn is None or c_user is None or c_profile is None:
-                continue
-
-            score = 0
-            score += 3 if c_conn else 0
-            score += 2 if c_user else 0
-            score += 2 if c_profile else 0
-            score += 1 if c_ip4 else 0
-            score += 1 if c_ip6 else 0
-            score += 1 if c_display_name else 0
-            score += 1 if c_client_id else 0
-
-            if score > best_score:
-                best_score = score
-                best = t
-                best_cols = {
-                    "conn": c_conn,
-                    "user": c_user,
-                    "profile": c_profile,
-                    "ip4": c_ip4 or "",
-                    "ip6": c_ip6 or "",
-                    "display_name": c_display_name or "",
-                    "client_id": c_client_id or "",
-                }
-                best_order = pick(order_candidates)
-
-        if best is None:
-            return
-
-        self._col_user = best_cols["user"] or None
-        self._col_profile = best_cols["profile"] or None
-        self._col_ip4 = best_cols["ip4"] or None
-        self._col_ip6 = best_cols["ip6"] or None
-        self._col_display_name = best_cols["display_name"] or None
-        self._col_client_id = best_cols["client_id"] or None
-
-        select_cols = [
-            self._col_user,
-            self._col_profile,
-            self._col_ip4,
-            self._col_ip6,
-            self._col_display_name,
-            self._col_client_id,
-        ]
-        select_cols_quoted = [f'"{c}"' for c in select_cols if c]
-        where_conn = best_cols["conn"]
-
-        q = f'SELECT {", ".join(select_cols_quoted)} FROM "{best}" WHERE "{where_conn}" = ?'
-        if best_order:
-            q += f' ORDER BY "{best_order}" DESC'
-        q += " LIMIT 1"
-        self._query = q
+            pass
+        if not self._ok and not self._warned:
+            self._warned = True
+            _log_err("portal db", RuntimeError(
+                f"no usable session table in {self._db_path}; connects without a portal "
+                "event get user=- until it appears (retried every minute)"))
 
     def lookup(self, conn_id: str) -> Optional[DbConnInfo]:
-        # Called from the correlator while self._lock is held, so keep it light:
-        # a fresh mode=ro connection with a 1s timeout (no write lock, WAL-safe).
         if not conn_id or conn_id == "-":
             return None
-        if self._query is None and time.time() >= self._retry_at:
-            self._detect()
-        if self._query is None:
+        if not self._ok and time.time() >= self._retry_at:
+            self._check()
+        if not self._ok:
             return None
         try:
-            conn = sqlite3.connect(self._uri, uri=True, timeout=1.0)
-            conn.row_factory = sqlite3.Row
-            try:
-                row = conn.execute(self._query, (conn_id,)).fetchone()
-            finally:
-                conn.close()
+            row = self._query_one(conn_id)
         except Exception as e:
             if isinstance(e, sqlite3.OperationalError) and str(e).startswith("no such"):
-                # Table/column gone (portal upgrade): detect the schema again.
-                self._query = None
+                self._ok = False  # table/column gone (portal upgrade): looked for again
             elif str(e) != "database is locked" and not self._lookup_warned:
                 # A lock is transient (user=- for one event); anything else, e.g.
                 # "unable to open database file", would silently turn every
@@ -559,37 +411,8 @@ class PortalDb:
         self._lookup_warned = False
         if row is None:
             return None
-
-        user = "-"
-        profile = "-"
-        ip4 = "-"
-        ip6 = "-"
-        display_name = "-"
-        client_id = "-"
-        try:
-            if self._col_user and row[self._col_user] is not None:
-                user = str(row[self._col_user])
-            if self._col_profile and row[self._col_profile] is not None:
-                profile = str(row[self._col_profile])
-            if self._col_ip4 and row[self._col_ip4] is not None:
-                ip4 = str(row[self._col_ip4])
-            if self._col_ip6 and row[self._col_ip6] is not None:
-                ip6 = str(row[self._col_ip6])
-            if self._col_display_name and row[self._col_display_name] is not None:
-                display_name = str(row[self._col_display_name])
-            if self._col_client_id and row[self._col_client_id] is not None:
-                client_id = str(row[self._col_client_id])
-        except Exception:
-            return None
-        return DbConnInfo(
-            user=user,
-            profile=profile,
-            ip4=ip4,
-            ip6=ip6,
-            display_name=display_name,
-            client_id=client_id,
-        )
-
+        user, profile, ip4, ip6, display_name = ("-" if v is None else str(v) for v in row)
+        return DbConnInfo(user=user, profile=profile, ip4=ip4, ip6=ip6, display_name=display_name)
 
 class Correlator:
     def __init__(self) -> None:
@@ -633,10 +456,12 @@ class Correlator:
         self._warned_portal_format = False
         self._wg_failed = 0  # failed `wg show` polls in a row
         self._write_warned = False
-        # When the sessions were saved (load_state): ProxyGuard starts written
-        # since then are read at start.
+        # The newest ProxyGuard start handled (from the daemon's start on): those after
+        # it are read again from the file when the daemon next starts, also the ones
+        # written in the last moments before a stop (save_state, load_state).
         self.stopped_at = 0.0
         self._started = time.time()
+        self._start_seen = self._started
         self._last_tcp_start = 0.0  # time.time() of the last ProxyGuard start read
         self._tcp_warned = False
         self._recent_lines: deque[str] = deque()
@@ -717,8 +542,10 @@ class Correlator:
         src_port: str,
         transport: str,
     ) -> None:
-        # Counters from the poller's snapshot (no subprocess under the lock).
-        last = self._wg_bytes_last.get(ev.conn)
+        # Counters from the poller's snapshot (no subprocess under the lock). A portal
+        # session's peer is created by its CONNECT, counters at 0: all of them count.
+        # A key that goes on after a silence (the peer kept) counts from here.
+        last = (0, 0) if ev.from_portal else self._wg_bytes_last.get(ev.conn)
         if last is not None:
             self._wg_bytes_baseline[ev.conn] = last
         else:
@@ -815,7 +642,7 @@ class Correlator:
                 info = dataclasses.replace(before, ts=ts, from_portal=False)
             elif db is not None:
                 info = ConnectEvent(ts=ts, user=db.user, profile=db.profile, conn=pubkey, ip4=db.ip4, ip6=db.ip6,
-                                    device=_device_from_client_marker(db.client_id, db.display_name))
+                                    device=_device_from_client_marker(db.display_name))
             if info is not None:
                 self._conn_info[pubkey] = info
         return info
@@ -848,56 +675,26 @@ class Correlator:
         return " tcp_match=port" if n == 0 else f" tcp_match=time tcp_candidates={n}"
 
     @staticmethod
-    def _wg_dump() -> Tuple[Dict[str, Tuple[int, int]], Optional[Dict[str, int]], Dict[str, str], bool]:
+    def _wg_dump() -> Tuple[Dict[str, Tuple[int, int]], Dict[str, int], Dict[str, str], bool]:
         # Spawn `wg show` and parse it. Runs WITHOUT the lock held (called from
         # update_wg_counters before locking), so a slow/hung wg never blocks the
         # event pipeline. The returned `ok` flag is True when wg actually ran
         # (return code 0) — even with zero peers — so the caller can tell a genuine
         # empty fleet (act on it: synthesize disconnects) from a failed poll
         # (skip: don't disconnect everyone because one `wg` call timed out).
-        # `handshake` is None when only the byte-counter fallback worked: then there
-        # is no liveness data and no events must be synthesized from it.
-        wg = shutil.which("wg") or "wg"
-        snap: Dict[str, Tuple[int, int]] = {}
-        handshake: Optional[Dict[str, int]] = {}
-        endpoint: Dict[str, str] = {}
-        ok = False
-
         try:
             p = subprocess.run(
-                [wg, "show", "all", "dump"],
+                [shutil.which("wg") or "wg", "show", "all", "dump"],
                 capture_output=True,
                 text=True,
                 errors="replace",  # an interface name that is not UTF-8 must not stop the poller
                 timeout=5.0,
             )
         except Exception:
-            p = None
-        if p is not None and p.returncode == 0:
-            ok = True
-            if p.stdout:
-                snap, handshake, endpoint = _parse_wg_dump_output(p.stdout)
-
-        if not ok:
-            # Degraded fallback: byte counters only (no handshake/endpoint, so no
-            # event synthesis this cycle — just keeps the transfer deltas moving).
-            handshake = None
-            try:
-                p = subprocess.run(
-                    [wg, "show", "all", "transfer"],
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    timeout=5.0,
-                )
-            except Exception:
-                p = None
-            if p is not None and p.returncode == 0:
-                ok = True
-                if p.stdout:
-                    snap = _parse_wg_transfer_output(p.stdout)
-
-        return snap, handshake, endpoint, ok
+            return {}, {}, {}, False
+        if p.returncode != 0:
+            return {}, {}, {}, False
+        return (*_parse_wg_dump_output(p.stdout), True)
 
     def update_wg_counters(self) -> None:
         # Called periodically by a background thread. The wg subprocess runs here
@@ -905,30 +702,26 @@ class Correlator:
         with self._lock:
             self._closed_while_polling = set()
         snap, handshake, endpoint, ok = self._wg_dump()
-        if handshake is None:
-            # Once per outage, not every poll: without `wg show ... dump` (wg missing,
-            # no CAP_NET_ADMIN, timeout) nothing is derived from WireGuard. From the
-            # second failed poll in a row: stopping the service kills the `wg` it is
-            # running, and that one poll is no outage.
+        if not ok:
+            # wg show failed this cycle (wg missing, no CAP_NET_ADMIN, timeout): don't
+            # act on absent data (it would synth a disconnect for every live peer), but
+            # time-based pruning is always safe. Said once per outage, from the second
+            # failed poll in a row: stopping the service kills the `wg` it is running,
+            # and that one poll is no outage.
             self._wg_failed += 1
             if self._wg_failed == 2:
                 _log_err("wg poller", RuntimeError(
                     "`wg show all dump` failed: no connect/roam/disconnect from WireGuard until it works"))
-        else:
-            self._wg_failed = 0
-        if not ok:
-            # wg show failed this cycle: don't act on absent data (it would synth a
-            # disconnect for every live peer), but time-based pruning is always safe.
             self._prune(time.time())
             return
+        self._wg_failed = 0
         with self._lock:
             # Sessions the portal closed while `wg show` ran: this snapshot predates
             # the DISCONNECT and would revive them (the key may be reused at once).
             for k in self._closed_while_polling:
                 snap.pop(k, None)
                 endpoint.pop(k, None)
-                if handshake is not None:
-                    handshake.pop(k, None)
+                handshake.pop(k, None)
             for k, (rx, tx) in snap.items():
                 last, base = self._wg_bytes_last.get(k), self._wg_bytes_baseline.get(k)
                 if last and base and (rx < last[0] or tx < last[1]):
@@ -946,10 +739,9 @@ class Correlator:
                     self._wg_bytes_baseline_pending.discard(pubkey)
 
             now = time.time()
-            if handshake is not None:
-                # Also with an empty fleet: peers that left wg must still get their
-                # synthesized disconnect.
-                self._synthesize_wg_events(now, handshake, endpoint)
+            # Also with an empty fleet: peers that left wg must still get their
+            # synthesized disconnect.
+            self._synthesize_wg_events(now, handshake, endpoint)
             # Reconcile the poller-populated maps to the live peer set so they don't
             # grow unbounded over the daemon's lifetime (peers removed from wg by
             # teardown / appGoneInterval drop out of `snap`). Keep peers still present
@@ -988,7 +780,7 @@ class Correlator:
 
     def _synthesize_wg_events(self, now: float, hs: Dict[str, int], ep: Dict[str, str]) -> None:
         # Derive connect/roam/disconnect by diffing the raw peer endpoints between
-        # polls, then feed them through _handle_wg_event_locked. WireGuard reports an
+        # polls (_wg_connected, _wg_roamed, _wg_disconnected). WireGuard reports an
         # endpoint and a last-handshake per peer, so polling `wg show` carries the
         # association at the poll resolution without any external daemon.
         for pubkey, last_hs in hs.items():
@@ -1031,7 +823,7 @@ class Correlator:
                 # since then follows below as a roam, so a ProxyGuard tunnel re-opened
                 # meanwhile claims its own start (left unclaimed, it could be matched
                 # to another client).
-                self._handle_wg_event_locked(first_hs, f"{pubkey} connected from {prev}")
+                self._wg_connected(first_hs, pubkey, prev)
             if prev != endpoint:
                 self._virtual_peers[pubkey] = endpoint
                 # Suppress port-only changes (same IP — typical NAT rebind) and
@@ -1053,7 +845,7 @@ class Correlator:
                 if real_roam and not held and not throttled:
                     self._roam_last[pubkey] = now
                     self._roam_owed.pop(pubkey, None)  # this line has the latest move
-                    self._handle_wg_event_locked(now, f"{pubkey} roamed to {endpoint}")
+                    self._wg_roamed(now, pubkey, endpoint)
                 elif _is_loopback(new_ip):
                     # No roam line now, but a new ProxyGuard tunnel still claims its
                     # start (or it could be matched to another client) and the next
@@ -1099,7 +891,7 @@ class Correlator:
             # polls or a restart. Never before the session's last source change.
             ts = min(now, float(last_hs) + SYNTH_DISCONNECT_AFTER_SEC) if last_hs else now
             ts = max(ts, self._pubkey_src.get(pubkey, (ts,))[0])
-            self._handle_wg_event_locked(ts, f"{pubkey} disconnected from {endpoint}")
+            self._wg_disconnected(ts, pubkey, endpoint)
 
     def _wg_peer_bytes_delta(self, pubkey: str) -> Tuple[str, str]:
         last = self._wg_bytes_last.get(pubkey)
@@ -1245,6 +1037,7 @@ class Correlator:
         # starts (/proxyguard/ needs no login) costs O(1) each.
         with self._lock:
             self._tcp_start_queue.append(TcpStartEvent(ts=ts, src_ip=src_ip, src_port=src_port, pgport=pgport))
+            self._start_seen = max(self._start_seen, ts)
             self._last_tcp_start = time.time()
             self._tcp_warned = False
 
@@ -1258,151 +1051,118 @@ class Correlator:
             if len(self._pg_proxied) > 4096:
                 del self._pg_proxied[next(iter(self._pg_proxied))]
 
-    def _handle_wg_event_locked(self, ts: float, message: str) -> None:
-        # Parses a "connected from / roamed to / disconnected from" WireGuard event
-        # (synthesized by _synthesize_wg_events) and emits the correlated line.
-        if WG_CONNECTED_PREFIX in message:
-            pubkey, endpoint = message.split(WG_CONNECTED_PREFIX, 1)
-            pubkey = pubkey.strip()
-            endpoint = endpoint.strip()
-            ip, port = _split_endpoint(endpoint)
-            if pubkey and ip is None:
-                return
-            before = self._pubkey_src.get(pubkey)
-            if _is_loopback(ip):
-                cur = before
-                tcp = None
-                if cur is not None and cur[3] == "tcp" and cur[1] != "-":
-                    pass  # already attributed (portal path): another start would be someone else's
-                else:
-                    tcp = self._match_tcp_start(ts, pubkey, ip, port)
-                if tcp is not None:
-                    self._pubkey_src[pubkey] = (ts, tcp.src_ip, tcp.src_port, "tcp")
-                elif cur is None or cur[1] == "-":
-                    self._pubkey_src[pubkey] = (ts, "-", "-", "tcp")
-                    if pubkey not in self._emitted_connect_ts:
-                        # No start yet: hold the connect (the portal's, if it already
-                        # announced the session) and let the prune retry the match.
-                        pending = self._pending_connect.get(pubkey)
-                        info = pending[1] if pending is not None else self._session_info(pubkey, ts)
-                        self._pending_connect[pubkey] = (ts, info or _unknown_session(pubkey, ts))
-                        return
-            else:
-                self._pubkey_src[pubkey] = (ts, ip or "-", port or "-", "udp")
+    def _end_session(self, pubkey: str) -> None:
+        # Every per-session map, at the end of a session: a key reused afterwards
+        # starts afresh, and nothing is kept for sessions that ended.
+        for d in (self._pubkey_src, self._pending_connect, self._conn_info, self._emitted_connect_ts,
+                  self._peer_last_handshake, self._wg_bytes_baseline, self._virtual_peers,
+                  self._tcp_candidates, self._roam_owed, self._virtual_due):
+            d.pop(pubkey, None)
+        self._wg_bytes_baseline_pending.discard(pubkey)
 
-            pending = self._pending_connect.pop(pubkey, None)
-            if pending is not None:
-                _pending_ts, ev = pending
-                _ts2, src_ip, src_port, transport = self._pubkey_src.get(pubkey, (ts, "-", "-", "unknown"))
-                if pubkey not in self._emitted_connect_ts:
-                    self._emit_connect(ev, src_ip, src_port, transport)
-                    self._emitted_connect_ts[pubkey] = ts
-            else:
-                if pubkey not in self._emitted_connect_ts:
-                    # Unknown users are not kept: the session's next lines ask the DB again.
-                    info = self._session_info(pubkey, ts)
-                    info = (dataclasses.replace(info, ts=ts, from_portal=False) if info is not None
-                            else _unknown_session(pubkey, ts))
-                    _ts2, src_ip, src_port, transport = self._pubkey_src.get(pubkey, (ts, "-", "-", "unknown"))
-                    self._emit_connect(info, src_ip, src_port, transport)
-                    self._emitted_connect_ts[pubkey] = ts
-                elif before is None and self._pubkey_src[pubkey][1] != "-":
-                    # Its connect was written without a source (no handshake within
-                    # the wait): the source comes as a roam line.
-                    self._roam_last[pubkey] = ts
-                    self._write_roam(ts, pubkey, "-", "-")
+    def _wg_connected(self, ts: float, pubkey: str, endpoint: str) -> None:
+        # A peer started handshaking (from _synthesize_wg_events): its connect line,
+        # or the connect held until its ProxyGuard start is read.
+        ip, port = _split_endpoint(endpoint)
+        if ip is None:
             return
-
-        if WG_ROAMED_PREFIX in message:
-            pubkey, endpoint = message.split(WG_ROAMED_PREFIX, 1)
-            pubkey = pubkey.strip()
-            endpoint = endpoint.strip()
-            ip, port = _split_endpoint(endpoint)
-            if pubkey and ip is None:
-                return
-
-            old = self._pubkey_src.get(pubkey)
-            if old is None:
-                src_ip_old, src_port_old, transport = "-", "-", "unknown"
+        before = self._pubkey_src.get(pubkey)
+        if _is_loopback(ip):
+            cur = before
+            tcp = None
+            if cur is not None and cur[3] == "tcp" and cur[1] != "-":
+                pass  # already attributed (portal path): another start would be someone else's
             else:
-                _old_ts, src_ip_old, src_port_old, transport = old
-
-            if _is_loopback(ip):
-                transport = "tcp"
                 tcp = self._match_tcp_start(ts, pubkey, ip, port)
-                if tcp is not None:
-                    ip = tcp.src_ip
-                    port = tcp.src_port
-                else:
-                    # A new tunnel without its start: source unknown. The previous one
-                    # (another tunnel, or the UDP path before a fallback) is not it.
-                    ip = "-"
-                    port = "-"
-                    self._tcp_candidates.pop(pubkey, None)
-            else:
-                transport = "udp"
-
-            self._pubkey_src[pubkey] = (ts, ip or "-", port or "-", transport)
-            self._write_roam(ts, pubkey, src_ip_old, src_port_old)
-            return
-
-        if WG_DISCONNECTED_PREFIX in message:
-            pubkey, endpoint = message.split(WG_DISCONNECTED_PREFIX, 1)
-            pubkey = pubkey.strip()
-            endpoint = endpoint.strip()
-            if pubkey:
-                # Already disconnected by the portal moments ago: don't log it twice.
-                # Unless a new session (same key) was announced since then — that one
-                # must get its own disconnect.
-                if (ts - self._emitted_disconnect_ts.get(pubkey, 0.0)) < 300.0 and pubkey not in self._emitted_connect_ts:
-                    self._pubkey_src.pop(pubkey, None)
-                    self._pending_connect.pop(pubkey, None)
-                    self._conn_info.pop(pubkey, None)
-                    self._emitted_connect_ts.pop(pubkey, None)
-                    self._peer_last_handshake.pop(pubkey, None)
-                    self._wg_bytes_baseline.pop(pubkey, None)
-                    self._wg_bytes_baseline_pending.discard(pubkey)
-                    self._virtual_peers.pop(pubkey, None)
-                    self._tcp_candidates.pop(pubkey, None)
-                    self._roam_owed.pop(pubkey, None)
-                    self._virtual_due.pop(pubkey, None)
+            if tcp is not None:
+                self._pubkey_src[pubkey] = (ts, tcp.src_ip, tcp.src_port, "tcp")
+            elif cur is None or cur[1] == "-":
+                self._pubkey_src[pubkey] = (ts, "-", "-", "tcp")
+                if pubkey not in self._emitted_connect_ts:
+                    # No start yet: hold the connect (the portal's, if it already
+                    # announced the session) and let the prune retry the match.
+                    pending = self._pending_connect.get(pubkey)
+                    info = pending[1] if pending is not None else self._session_info(pubkey, ts)
+                    self._pending_connect[pubkey] = (ts, info or _unknown_session(pubkey, ts))
                     return
+        else:
+            self._pubkey_src[pubkey] = (ts, ip or "-", port or "-", "udp")
 
-                src = self._pubkey_src.get(pubkey)
-                if src is None:
-                    ip, port = _split_endpoint(endpoint)
-                    if ip and not _is_loopback(ip):
-                        src_ip, src_port, transport = ip, port or "-", "udp"
-                    elif ip:
-                        # Never time-match a start here (see _wg_peer_endpoint).
-                        src_ip, src_port, transport = "-", "-", "tcp"
-                    else:
-                        src_ip, src_port, transport = "-", "-", "unknown"
-                else:
-                    _ts2, src_ip, src_port, transport = src
+        pending = self._pending_connect.pop(pubkey, None)
+        if pending is not None:
+            _pending_ts, ev = pending
+            _ts2, src_ip, src_port, transport = self._pubkey_src.get(pubkey, (ts, "-", "-", "unknown"))
+            if pubkey not in self._emitted_connect_ts:
+                self._emit_connect(ev, src_ip, src_port, transport)
+                self._emitted_connect_ts[pubkey] = ts
+        elif pubkey not in self._emitted_connect_ts:
+            # Unknown users are not kept: the session's next lines ask the DB again.
+            info = self._session_info(pubkey, ts)
+            info = (dataclasses.replace(info, ts=ts, from_portal=False) if info is not None
+                    else _unknown_session(pubkey, ts))
+            _ts2, src_ip, src_port, transport = self._pubkey_src.get(pubkey, (ts, "-", "-", "unknown"))
+            self._emit_connect(info, src_ip, src_port, transport)
+            self._emitted_connect_ts[pubkey] = ts
+        elif before is None and self._pubkey_src[pubkey][1] != "-":
+            # Its connect was written without a source (no handshake within
+            # the wait): the source comes as a roam line.
+            self._roam_last[pubkey] = ts
+            self._write_roam(ts, pubkey, "-", "-")
 
-                info = self._session_info(pubkey, ts)
-                user, profile = (info.user, info.profile) if info is not None else ("-", "-")
-                bytes_in, bytes_out = self._wg_peer_bytes_delta(pubkey)
-                # Synthesized from handshake silence, not reported by the portal.
-                self._emit_disconnect(ts, user, profile, pubkey, bytes_in, bytes_out, src_ip, src_port, transport, inferred=True)
-                self._emitted_disconnect_ts[pubkey] = ts
-                # From now, not ts (which can be hours back after a restart): the
-                # portal's late DISCONNECT gets its 5 minutes.
-                self._silence_closed[pubkey] = (time.time(), info)
-                self._peer_last_handshake.pop(pubkey, None)
-
-                self._pubkey_src.pop(pubkey, None)
-                self._pending_connect.pop(pubkey, None)
-                self._conn_info.pop(pubkey, None)
-                self._emitted_connect_ts.pop(pubkey, None)
-                self._wg_bytes_baseline.pop(pubkey, None)
-                self._wg_bytes_baseline_pending.discard(pubkey)
-                self._virtual_peers.pop(pubkey, None)
-                self._tcp_candidates.pop(pubkey, None)
-                self._roam_owed.pop(pubkey, None)
-                self._virtual_due.pop(pubkey, None)
+    def _wg_roamed(self, ts: float, pubkey: str, endpoint: str) -> None:
+        # The source of an active peer changed (from _synthesize_wg_events).
+        ip, port = _split_endpoint(endpoint)
+        if ip is None:
             return
+        old = self._pubkey_src.get(pubkey)
+        src_ip_old, src_port_old = (old[1], old[2]) if old is not None else ("-", "-")
+        if _is_loopback(ip):
+            transport = "tcp"
+            tcp = self._match_tcp_start(ts, pubkey, ip, port)
+            if tcp is not None:
+                ip = tcp.src_ip
+                port = tcp.src_port
+            else:
+                # A new tunnel without its start: source unknown. The previous one
+                # (another tunnel, or the UDP path before a fallback) is not it.
+                ip = "-"
+                port = "-"
+                self._tcp_candidates.pop(pubkey, None)
+        else:
+            transport = "udp"
+        self._pubkey_src[pubkey] = (ts, ip or "-", port or "-", transport)
+        self._write_roam(ts, pubkey, src_ip_old, src_port_old)
+
+    def _wg_disconnected(self, ts: float, pubkey: str, endpoint: str) -> None:
+        # The peer's handshake has been silent past the threshold (from
+        # _synthesize_wg_events): an inferred disconnect.
+        if (ts - self._emitted_disconnect_ts.get(pubkey, 0.0)) < 300.0 and pubkey not in self._emitted_connect_ts:
+            # Already disconnected by the portal moments ago: don't log it twice.
+            # Unless a new session (same key) was announced since then — that one
+            # must get its own disconnect.
+            self._end_session(pubkey)
+            return
+        src = self._pubkey_src.get(pubkey)
+        if src is None:
+            ip, port = _split_endpoint(endpoint)
+            if ip and not _is_loopback(ip):
+                src_ip, src_port, transport = ip, port or "-", "udp"
+            elif ip:
+                # Never time-match a start here (see _wg_peer_endpoint).
+                src_ip, src_port, transport = "-", "-", "tcp"
+            else:
+                src_ip, src_port, transport = "-", "-", "unknown"
+        else:
+            _ts2, src_ip, src_port, transport = src
+        info = self._session_info(pubkey, ts)
+        user, profile = (info.user, info.profile) if info is not None else ("-", "-")
+        bytes_in, bytes_out = self._wg_peer_bytes_delta(pubkey)
+        self._emit_disconnect(ts, user, profile, pubkey, bytes_in, bytes_out, src_ip, src_port, transport, inferred=True)
+        self._emitted_disconnect_ts[pubkey] = ts
+        # From now, not ts (which can be hours back after a restart): the
+        # portal's late DISCONNECT gets its 5 minutes.
+        self._silence_closed[pubkey] = (time.time(), info)
+        self._end_session(pubkey)
 
     def on_portal(self, ts: float, message: str) -> None:
         with self._lock:
@@ -1430,7 +1190,7 @@ class Correlator:
             device = "-"
             db = self._db.lookup(conn)
             if db is not None:
-                device = _device_from_client_marker(db.client_id, db.display_name)
+                device = _device_from_client_marker(db.display_name)
                 # The key's DB row over the log text, where the user ID is written
                 # raw: one holding " KEY=..." would be read as a shorter one.
                 user = db.user if db.user != "-" else user
@@ -1493,16 +1253,7 @@ class Correlator:
                 self._emitted_disconnect_ts[conn] = ts
             # End of session: drop ALL per-session state, including the connect
             # marker — otherwise a reconnect with the same key would be swallowed.
-            self._emitted_connect_ts.pop(conn, None)
-            self._peer_last_handshake.pop(conn, None)
-            self._conn_info.pop(conn, None)
-            self._pubkey_src.pop(conn, None)
-            self._wg_bytes_baseline.pop(conn, None)
-            self._wg_bytes_baseline_pending.discard(conn)
-            self._virtual_peers.pop(conn, None)
-            self._tcp_candidates.pop(conn, None)
-            self._roam_owed.pop(conn, None)
-            self._virtual_due.pop(conn, None)
+            self._end_session(conn)
             # The portal removed the peer before logging: its last endpoint/counters
             # belong to the ended session. A CONNECT reusing the key (allowed by the
             # API) must not inherit them, nor time-match another client's TCP start.
@@ -1534,13 +1285,10 @@ class Correlator:
                 "silence_closed": {k: asdict(who) for k, (_seen, who) in self._silence_closed.items()},
                 "tcp_starts": [[e.ts, e.src_ip, e.src_port, e.pgport] for e in self._tcp_start_queue],
                 "pg_proxied": self._pg_proxied,
-                "stopped": time.time(),  # the starts read so far: the ones after come at start
+                # The starts after this one were not handled: read from the file at start.
+                "stopped": self._start_seen,
             }
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
-            json.dump(data, f)  # user IDs and addresses: root only (0600)
-        os.replace(tmp, path)
+        _write_private(path, json.dumps(data))  # user IDs and addresses: root only
 
     def load_state(self, path: str) -> None:
         try:
@@ -1593,6 +1341,8 @@ class Correlator:
             for a, (ts, ip, port) in data.get("pg_proxied", {}).items():
                 self._pg_proxied[str(a)] = (float(ts), str(ip), str(port))
             self.stopped_at = float(data.get("stopped", 0.0))  # 0: saved by a release without it
+            if self.stopped_at:
+                self._start_seen = self.stopped_at  # if stopped again before the backlog is read: read again
         except Exception as e:
             for d in maps:
                 d.clear()
@@ -1673,13 +1423,24 @@ def _load_cursor() -> Optional[str]:
     return c or None
 
 
+def _write_private(path: str, text: str) -> None:
+    # Atomic replace (a crash mid-write never leaves half a file), readable by root
+    # only, and always through a file of its own: a link or a file someone planted
+    # in the directory (one created by another user, say under /tmp) is replaced,
+    # never written through.
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        os.unlink(tmp)  # left by a crash, or planted
+    except FileNotFoundError:
+        pass
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
 def _save_cursor(cursor: str) -> None:
-    # Atomic replace: a crash mid-write must never leave a truncated cursor.
-    os.makedirs(os.path.dirname(CURSOR_PATH) or ".", exist_ok=True)
-    tmp = CURSOR_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(cursor)
-    os.replace(tmp, CURSOR_PATH)
+    _write_private(CURSOR_PATH, cursor)
 
 
 def _portal_journal_cmd(cursor: Optional[str], follow: bool = True) -> list[str]:
