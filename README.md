@@ -42,8 +42,8 @@ keys shortened).*
 - **Complete**: user, profile, device, tunnel addresses, public source IP and
   port (IPv4 and IPv6), transport, traffic, country and city.
 - **Sees through ProxyGuard**: recovers the real address of clients that
-  tunnel WireGuard over HTTPS, exactly with ProxyGuard 2.1.1 or later, and says
-  how each one was found.
+  tunnel WireGuard over HTTPS, exactly with ProxyGuard 2.1.1 or later (2.2.0 in
+  eduVPN's repository), and says how each one was found.
 - **Self-contained**: a single-file Python daemon, standard library only, plus
   a small helper service for ProxyGuard. Nothing to compile, no patch to
   eduVPN, no kernel module.
@@ -64,7 +64,7 @@ keys shortened).*
 - [Limitations](#limitations)
 - [Security and privacy](#security-and-privacy)
 - [Upgrade and removal](#upgrade-and-removal)
-- [ProxyGuard with its own TLS (upcoming)](#proxyguard-with-its-own-tls-upcoming)
+- [ProxyGuard with its own TLS](#proxyguard-with-its-own-tls)
 - [FAQ](#faq)
 - [Related projects](#related-projects)
 - [Acknowledgements](#acknowledgements)
@@ -300,9 +300,9 @@ the daemon starts from the present.
   PostgreSQL or MariaDB everything works from the portal's events, without the
   database fallback (see [Limitations](#limitations)).
 - *Optional:* ProxyGuard 2.1.1 or later (`proxyguard-server` from the eduVPN
-  repository, on the same host) for exact ProxyGuard source addresses; with an
-  older one they are matched by time (2.1.0: exact with the
-  [manual setup](#manual-setup) only).
+  repository, where it comes with 2.2.0, on the same host) for exact ProxyGuard
+  source addresses; with an older one they are matched by time (2.1.0: exact
+  with the [manual setup](#manual-setup) only).
 - *Optional:* `python3-maxminddb` and a MaxMind GeoLite2-City database for
   `country` and `city` ([GeoIP](#geoip-optional)).
 
@@ -325,7 +325,7 @@ changing the eduVPN setup.
 |---|---|
 | portal connection log | if it is off, turns it on in `/etc/vpn-user-portal/config.php` with the recommended templates. The edit is checked with PHP before the file is replaced, the original is kept as `config.php.eduvpn-logger.bak`, and templates already set are kept. |
 | ProxyGuard source IPs | if a VirtualHost proxies ProxyGuard (`/proxyguard/`, or any path upgraded to `UoTLV`): has Apache log tunnel starts, with a conf file of its own (`eduvpn-logger-proxyguard.conf`, then `configtest` and a graceful reload; if `configtest` fails, the previous version is kept, or none), and starts `proxyguard-watcher` on that VirtualHost's `ErrorLog` |
-| ProxyGuard, exact (2.1.1 or later) | in the same conf file, server-wide, Apache's default error log format plus the port of each tunnel's connection to proxyguard-server, on trace lines only (an `ErrorLogFormat` of your own is left alone: see [Manual setup](#manual-setup)); a drop-in, `proxyguard-server.service.d/eduvpn-logger.conf`, that sets `OTHER_ARGS=-logip` for proxyguard-server, leaving its command line to the package. Restarting proxyguard-server drops the open ProxyGuard tunnels (the apps reconnect at once), so it is asked for; without a terminal it is left to you, with a note. With ProxyGuard older than 2.1, nothing is changed and the check says to upgrade it; with 2.1.0, whose unit has no `OTHER_ARGS`, nothing is changed either (overriding its command line could stop proxyguard-server after a package update): re-run `install.sh` once 2.1.1 is installed. |
+| ProxyGuard, exact (2.1.1 or later) | in the same conf file, server-wide, Apache's default error log format plus the port of each tunnel's connection to proxyguard-server, on trace lines only (an `ErrorLogFormat` of your own is left alone: see [Manual setup](#manual-setup)); a drop-in, `proxyguard-server.service.d/eduvpn-logger.conf`, that sets `OTHER_ARGS=-logip` for proxyguard-server, leaving its command line to the package. Restarting proxyguard-server drops the open ProxyGuard tunnels (the apps reconnect at once), so it is asked for; without a terminal it is left to you, with a note. With ProxyGuard older than 2.1, nothing is changed and the check says to upgrade it; with 2.1.0, whose unit has no `OTHER_ARGS`, nothing is changed either (overriding its command line could stop proxyguard-server after a package update): re-run `install.sh` once 2.1.1 or later is installed (2.2.0 in eduVPN's repository). |
 | packages | `wireguard-tools`, `python3`, `logrotate`; optional `python3-maxminddb`, and `geoipupdate` with a MaxMind account (MaxMind's own package where the distribution has none, checked against its published checksums). Only missing ones: nothing already installed is upgraded. |
 | programs, units | `/usr/local/sbin/eduvpn-logger.py`, `proxyguard-watcher.py`; `/etc/systemd/system/eduvpn-logger.service`, `proxyguard-watcher.service` |
 | logs | `/var/log/eduvpn` (`2750 root:adm`), rotated daily by `/etc/logrotate.d/eduvpn-logger`. If rsyslog is installed and runs as root (Debian, EL, Fedora; not Ubuntu), the syslog copy is also written there, to `eduvpn-syslog.log`. Both files are yours to adapt (retention, forwarding): once changed, upgrades keep them, with a warning. |
@@ -340,7 +340,7 @@ It ends with a check:
   portal DB      ok (128 WireGuard configurations)
   WireGuard      wg0
   ProxyGuard     watcher active, following /var/log/apache2/vpn.example.org_ssl_error.log
-  PG sources     exact, by port (proxyguard-server 2.1.1 -logip)
+  PG sources     exact, by port (proxyguard-server 2.2.0 -logip)
   GeoIP          off (optional: sudo GEOIP_ACCOUNT_ID=<MaxMind account> ./install.sh)
 
 ==> Ready. Output: /var/log/eduvpn/eduvpn.log (also journalctl -t eduvpn-logger)
@@ -510,7 +510,8 @@ ExecStart=
 ExecStart=/usr/sbin/proxyguard-server -listen ${LISTEN} -to ${TO} -logip
 ```
 
-Remove this drop-in when 2.1.1 arrives (then re-run `install.sh`), and before
+Remove this drop-in when 2.1.1 or later arrives (2.2.0 in eduVPN's repository;
+then re-run `install.sh`), and before
 downgrading proxyguard-server below 2.1, which does not start with `-logip`.
 
 To apply either setting, restart proxyguard-server at a quiet time, since the
@@ -679,7 +680,8 @@ zgrep -h ' event=connect .*country=' /var/log/eduvpn/eduvpn.log* | grep -v 'coun
 
 ## Limitations
 
-- **ProxyGuard source IPs are exact from ProxyGuard 2.1.1.** With
+- **ProxyGuard source IPs are exact from ProxyGuard 2.1.1** (2.2.0 in eduVPN's
+  repository). With
   proxyguard-server's `-logip` and Apache's `[pgport]` (both set up by
   `install.sh`), each tunnel is followed port by port from WireGuard to the
   client (`tcp_match=port`). Without them (ProxyGuard older than 2.1, which
@@ -695,7 +697,7 @@ zgrep -h ' event=connect .*country=' /var/log/eduvpn/eduvpn.log* | grep -v 'coun
   are exact. Several proxyguard-server instances on one host must be units
   named `proxyguard-server*.service`; one on another host (a dedicated proxy)
   is not followed: its sessions read as UDP from the proxy's address (see
-  [ProxyGuard with its own TLS](#proxyguard-with-its-own-tls-upcoming)).
+  [ProxyGuard with its own TLS](#proxyguard-with-its-own-tls)).
 - **Apache's error log format is set server-wide** (ProxyGuard 2.1.1 or later).
   It is Apache's default plus `[pgport N]` on trace lines only, which only
   ProxyGuard's tunnel starts have, so other tools reading Apache's error logs
@@ -777,9 +779,9 @@ before 12 October 2026 saves no sessions when it stops: upgrading from it, the
 sessions open at that moment are announced again once (`inferred=1`), as after
 a crash.
 
-After upgrading proxyguard-server from 2.1.0 or older to 2.1.1 or later,
-re-run `install.sh` once: only then are ProxyGuard sources exact. Later
-updates, and a downgrade, need nothing: the drop-in only sets `OTHER_ARGS`,
+After upgrading proxyguard-server from 2.1.0 or older to 2.1.1 or later
+(eduVPN's repository goes from 2.1.0 to 2.2.0), re-run `install.sh` once: only
+then are ProxyGuard sources exact. Later updates, and a downgrade, need nothing: the drop-in only sets `OTHER_ARGS`,
 which an older unit does not use (re-running `install.sh` then removes it). To
 go back to an earlier version of eduvpn-logger, run this version's
 `install.sh --uninstall` first: an earlier `proxyguard-watcher` does not read
@@ -802,32 +804,36 @@ on, the previous `config.php` is in `config.php.eduvpn-logger.bak`),
 `/etc/GeoIP.conf` and the packages. A trace block added to the VirtualHost by
 hand stays too.
 
-## ProxyGuard with its own TLS (upcoming)
+## ProxyGuard with its own TLS
 
-ProxyGuard's development code (commit `ac8576c` of 23 October 2026, in no
-release yet: the latest is 2.1.1) lets proxyguard-server take the apps'
-connections itself, with a certificate of its own, instead of behind Apache:
+ProxyGuard 2.2.0 (2 November 2026) lets proxyguard-server take the apps'
+connections itself, with a certificate of its own, instead of behind Apache,
+and vpn-user-portal 3.16.0 (3 November 2026) sends the apps there when its
+`WireGuard` section sets `proxyOnNode`:
 
 ```
-today:     app ──HTTPS──▶ Apache ──HTTP──▶ proxyguard-server (127.0.0.1)   ──UDP──▶ WireGuard
-upcoming:  app ──TLS─────────────────────▶ proxyguard-server (public port) ──UDP──▶ WireGuard
+behind Apache:  app ──HTTPS──▶ Apache ──HTTP──▶ proxyguard-server (127.0.0.1)   ──UDP──▶ WireGuard
+own TLS:        app ──TLS─────────────────────▶ proxyguard-server (public port) ──UDP──▶ WireGuard
 ```
 
-It is turned on in proxyguard-server's unit: certificate and key as systemd
-credentials (`LoadCredential=fullchain.pem:…` and `LoadCredential=privkey.pem:…`),
-a public `LISTEN` (the example is `:443`) and `CAP_NET_BIND_SERVICE`; TLS 1.3 and
-HTTP/1.x only. These names come from the development code: check them against
-the release notes once it is released.
+It is turned on in proxyguard-server's unit, with a drop-in: certificate and
+key as systemd credentials (`LoadCredential=fullchain.pem:…` and
+`LoadCredential=privkey.pem:…`) and `LISTEN=:443` (2.2.0's unit has
+`CAP_NET_BIND_SERVICE`); TLS 1.3 and HTTP/1.x only. eduVPN documents it for
+separate nodes only ("ProxyGuard with TLS Directly on Node" in
+[eduVPN's WireGuard documentation](https://docs.eduvpn.org/server/v3/wireguard.html)):
+on a single server TCP port 443 is Apache's, and the address the portal gives
+the apps does not change, since the node's host name is the portal's.
 
 eduvpn-logger finds the address of a ProxyGuard client in Apache's log, so it
 does not follow such a setup yet. What happens, and what to change:
 
 | Setup | WireGuard sees | eduvpn-logger today | To support it |
 |---|---|---|---|
-| Apache in front of proxyguard-server, same host | `127.0.0.1` | exact from ProxyGuard 2.1.1, by time before | nothing |
-| proxyguard-server with its own TLS, same host (on another port or address than Apache's) | `127.0.0.1` | `transport=tcp src_ip="-"`, after 10 min the warning `ProxyGuard (TCP) session but no tunnel start read`; `install.sh` reports ProxyGuard as `not in use` | steps 1 and 2 below |
+| Apache in front of proxyguard-server, same host | `127.0.0.1` | exact from ProxyGuard 2.1.1 (2.2.0 in eduVPN's repository), by time before | nothing |
+| proxyguard-server with its own TLS, same host (not in eduVPN's documentation: on another address than Apache's, or on another port through the portal's `proxyUrl`) | `127.0.0.1` | `transport=tcp src_ip="-"`, after 10 min the warning `ProxyGuard (TCP) session but no tunnel start read`; `install.sh` reports ProxyGuard as `not in use` | steps 1 and 2 below |
 | proxyguard-server, with or without Apache, on another host (a dedicated proxy) | the proxy's address | `transport=udp` with the **proxy's** address and location: misleading | step 3 below |
-| several nodes, proxyguard-server on each | `127.0.0.1`, on the node | not supported: the portal runs on another host ([Requirements](#requirements)) | — |
+| several nodes, proxyguard-server on each (with its own TLS: eduVPN's documented setup) | `127.0.0.1`, on the node | not supported: the portal runs on another host ([Requirements](#requirements)) | multi-node support first, then step 1 on the node |
 
 ### 1. The client from proxyguard-server's own line
 
@@ -859,9 +865,15 @@ proxyguard-watcher. In `eduvpn-logger.py`:
   (`_trusted_proxyguard_entry()`). The first address is the TCP peer
   proxyguard-server sees: exact, unless a load balancer that rewrites addresses
   stands in front, as for UDP ([Limitations](#limitations)).
-- Check the line's format on the release: the parser (`_PG_PROXIED_RE`) matches
-  the whole line on purpose, since proxyguard-server's error lines quote what
-  clients send.
+- Take the first address for the client only when it is no proxy's: during a
+  migration eduVPN's documentation has the controller's Apache forward the apps
+  that still use the old address to the node's proxyguard-server over HTTPS, and
+  their lines carry the controller's address. Like loopback today, such a line
+  needs the proxy's own tunnel start.
+- The line is the same in 2.2.0 (`<RemoteAddr> proxied as <local address of its
+  UDP socket>`), an IPv6 client written `[…]:port`, as `_split_endpoint()` reads
+  it. The parser (`_PG_PROXIED_RE`) matches the whole line on purpose, since
+  proxyguard-server's error lines quote what clients send.
 
 ### 2. install.sh
 
@@ -905,7 +917,7 @@ src_ip="<its public address>" src_port=… transport=tcp tcp_match=port`, two ap
 opening tunnels at the same moment must each get their own address, and the
 setup with Apache in front must work as before. Until eduvpn-logger supports
 it, keep Apache in front of proxyguard-server: sources are exact from
-ProxyGuard 2.1.1.
+ProxyGuard 2.1.1 (2.2.0 in eduVPN's repository).
 
 ## FAQ
 

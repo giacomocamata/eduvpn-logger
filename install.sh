@@ -355,7 +355,7 @@ if [ -n "$PG_VHOST" ]; then
             elif [[ $PGS_EXEC != *OTHER_ARGS* ]]; then
                 # ProxyGuard 2.1.0's unit passes no other arguments: overriding its
                 # ExecStart would break the service if a package update changed it.
-                PG_EXACT="proxyguard-server ${PGS_VER:-?}'s unit takes no other options (2.1.1 does): re-run install.sh after upgrading"
+                PG_EXACT="proxyguard-server ${PGS_VER:-?}'s unit takes no other options (2.1.1 or later does; eduVPN's repository: 2.2.0): re-run install.sh after upgrading"
             elif [ -z "$PGS_OTHER" ]; then
                 PGS_NEW="Environment=OTHER_ARGS=-logip"
             elif [[ $PGS_OTHER != *-logip* ]]; then
